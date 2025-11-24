@@ -1,0 +1,5 @@
+PySide6
+appium-python-client==2.11.1
+selenium==4.15.2
+undetected-chromedriver==3.5.5
+faker==19.12.0
