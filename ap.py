@@ -181,6 +181,13 @@ class AfterPayBatchValidator:
             # Small delay after creation
             time.sleep(2)
             
+            # Set timeouts to prevent hanging
+            try:
+                self.driver.set_page_load_timeout(20)
+                self.driver.set_script_timeout(20)
+            except Exception:
+                pass
+
             # Set window size explicitly after creation
             try:
                 self.driver.set_window_size(500, 500)
@@ -335,6 +342,11 @@ class AfterPayBatchValidator:
                 page_source = self.driver.page_source
             except Exception:
                 pass
+
+            # Check specifically for "An unknown error occurred. Please try again."
+            if page_source and "An unknown error occurred. Please try again." in page_source:
+                logger.warning("⚠️ Detected 'An unknown error occurred'. Triggering hard reload (clear cache)...")
+                raise BrowserDetectedException("An unknown error occurred. Please try again.")
 
             # Use DOM detection first; classify as valid if password input present
             if password_present:
@@ -662,28 +674,45 @@ class AfterPayBatchProcessor:
         if not PSUTIL_AVAILABLE:
             logger.debug("psutil not available - skipping orphan driver cleanup")
             return
+        
+        logger.info("🧹 Cleaning up orphan drivers...")
+        start_cleanup = time.time()
+        my_pid = os.getpid()
+        
         try:
             current_pids = set()
             with self._pid_lock:
                 for v in self.browser_pids.values():
                     if v:
                         current_pids.add(v)
+            
+            # Use a faster iteration if possible, and limit time
             for p in psutil.process_iter(['pid', 'cmdline', 'create_time']):
+                # Safety timeout - don't spend more than 5 seconds cleaning up
+                if time.time() - start_cleanup > 5:
+                    logger.warning("⚠️ Orphan cleanup timed out, skipping remaining checks")
+                    break
+                    
                 try:
                     pid = p.info.get('pid')
+                    if pid == my_pid:
+                        continue
+                        
                     cmdline = ' '.join(p.info.get('cmdline') or [])
                     if not cmdline:
                         continue
+                    
+                    # Check for our specific markers
                     if ('ap_profile_' in cmdline or 'undetected_chromedriver' in cmdline or 'undetect' in cmdline) and pid not in current_pids:
                         try:
-                            logger.info(f"🧹 Killing orphan driver PID {pid} (cmd: {cmdline})")
+                            logger.info(f"🧹 Killing orphan driver PID {pid}")
                             p.kill()
                         except Exception:
                             pass
                 except Exception:
                     pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Error during orphan cleanup: {e}")
         
     def load_emails_from_file(self, filename='list.txt'):
         """Load emails from file"""

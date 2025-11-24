@@ -52,6 +52,87 @@ class StyledButton(QPushButton):
         self.setFixedHeight(38)
 
 
+class ModernStepper(QFrame):
+    def __init__(self, min_val=1, max_val=5, initial_val=None, parent=None):
+        super().__init__(parent)
+        self.min_val = min_val
+        self.max_val = max_val
+        self.current_val = initial_val if initial_val is not None else max_val
+
+        # Styling Container Utama
+        self.setFixedSize(140, 45)
+        self.setStyleSheet("""
+            QFrame {
+                background-color: #2E3344;
+                border-radius: 8px;
+                border: 1px solid #3E4455;
+            }
+        """)
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(5, 0, 5, 0)
+        layout.setSpacing(0)
+
+        # Tombol Minus
+        self.btn_minus = QPushButton("-")
+        self.btn_minus.setCursor(Qt.PointingHandCursor)
+        self.style_stepper_btn(self.btn_minus)
+        self.btn_minus.clicked.connect(self.decrement)
+
+        # Label Angka
+        self.lbl_value = QLabel(str(self.current_val))
+        self.lbl_value.setAlignment(Qt.AlignCenter)
+        self.lbl_value.setStyleSheet("""
+            color: #FFFFFF;
+            font-weight: bold;
+            font-size: 16px;
+            border: none;
+            background: transparent;
+        """)
+
+        # Tombol Plus
+        self.btn_plus = QPushButton("+")
+        self.btn_plus.setCursor(Qt.PointingHandCursor)
+        self.style_stepper_btn(self.btn_plus)
+        self.btn_plus.clicked.connect(self.increment)
+
+        layout.addWidget(self.btn_minus)
+        layout.addWidget(self.lbl_value)
+        layout.addWidget(self.btn_plus)
+
+    def style_stepper_btn(self, btn):
+        btn.setFixedSize(30, 30)
+        btn.setStyleSheet("""
+            QPushButton {
+                color: #64B5F6; /* Warna Biru Muda */
+                background-color: transparent;
+                border: none;
+                font-weight: bold;
+                font-size: 18px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #3E4455;
+            }
+            QPushButton:pressed {
+                background-color: #1A1D29;
+            }
+        """)
+
+    def increment(self):
+        if self.current_val < self.max_val:
+            self.current_val += 1
+            self.lbl_value.setText(str(self.current_val))
+
+    def decrement(self):
+        if self.current_val > self.min_val:
+            self.current_val -= 1
+            self.lbl_value.setText(str(self.current_val))
+
+    def value(self):
+        return self.current_val
+
+
 class GuiLogHandler(logging.Handler):
     """Logging handler that emits messages to a PySide signal"""
     def __init__(self, signal=None):
@@ -288,11 +369,6 @@ class MainWindow(QMainWindow):
         """)
         
         emails = [
-            "missyharveyrn@yahoo.com", "juliaanguyen2011@Yahoo.com", "aprilclark333@yahoo.com",
-            "burden.derrick@yahoo.com", "doryl_martin56@yahoo.com", "goldie2207@yahoo.com",
-            "divababy200003@yahoo.com", "madisonrcathey@yahoo.com", "liannyortiztabares19@yahoo.com",
-            "tsitiridisg0812@yahoo.com", "zachhayden10@yahoo.com", "dlyric82@yahoo.com",
-            "johnswlj3@yahoo.com", "grneyz.4310@yahoo.com", "phil_allmoneyin@yahoo.com"
         ]
         self.email_list.addItems(emails)
         list_layout.addWidget(self.email_list)
@@ -361,13 +437,7 @@ class MainWindow(QMainWindow):
             .r { color: #ff5555; font-weight:bold; } .w { color: white; }
         </style>
         <div class='w' style='line-height: 1.4;'>
-        <span class='d'>[INFO]</span> <span class='g'>✅ Undetected Chrome driver created successfully</span><br>
-        <span class='w'>📊 Progress: 1 processed | <span class='g'>✅ 0 valid</span> | <span class='r'>❌ 1 invalid</span></span><br>
-        <span class='d'>[INFO]</span> [Browser-1] test2@gmail.com → <span class='r'>❌ INVALID (1/2)</span><br>
-        <span class='d'>[INFO]</span> 🚪 Browser closed<br>
-        <span class='w'>📊 Progress: 2 processed | <span class='g'>✅ 0 valid</span> | <span class='r'>❌ 2 invalid</span></span><br>
-        <span class='d'>[INFO]</span> [Browser-2] invalid@xyz.com → <span class='r'>❌ INVALID (2/2)</span><br>
-        <span class='d'>[INFO]</span> 🏁 Fast batch validation complete<br>
+        <span class='d'>[INFO]</span> <span class='g'>✅ System is Ready to Road</span><br>
         </div>
         """
         self.log_console.setHtml(html_log.strip())
@@ -406,58 +476,7 @@ class MainWindow(QMainWindow):
         lbl_win = QLabel("Windows Tab")
         lbl_win.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
         
-        self.spin_windows = QSpinBox()
-        self.spin_windows.setRange(1, 100)
-        self.spin_windows.setValue(5)
-        self.spin_windows.setFixedSize(80, 45)
-        
-        # QSS BLACK MAGIC UNTUK BIKIN STEPPER KAYAK GAMBAR
-        self.spin_windows.setStyleSheet("""
-            QSpinBox {
-                background-color: #d0d0d0; 
-                color: #111; 
-                font-weight: 900; 
-                font-size: 20px;
-                border-radius: 6px;
-                padding-left: 10px;
-                border: 2px solid #d0d0d0;
-            }
-            /* Tombol Panah Atas */
-            QSpinBox::up-button {
-                subcontrol-origin: border;
-                subcontrol-position: top right;
-                width: 25px; 
-                background-color: #c0c0c0;
-                border-top-right-radius: 6px;
-                border-left: 1px solid #999; /* Garis Pemisah */
-                border-bottom: 1px solid #999;
-            }
-            /* Tombol Panah Bawah */
-            QSpinBox::down-button {
-                subcontrol-origin: border;
-                subcontrol-position: bottom right;
-                width: 25px;
-                background-color: #c0c0c0;
-                border-bottom-right-radius: 6px;
-                border-left: 1px solid #999; /* Garis Pemisah */
-            }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                background-color: #b0b0b0;
-            }
-            /* Panah Segitiga Hitam */
-            QSpinBox::up-arrow {
-                width: 0; height: 0;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-bottom: 6px solid black; /* Segitiga Hitam */
-            }
-            QSpinBox::down-arrow {
-                width: 0; height: 0;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 6px solid black; /* Segitiga Hitam */
-            }
-        """)
+        self.spin_windows = ModernStepper(min_val=1, max_val=20, initial_val=5)
         
         win_layout.addWidget(lbl_win)
         win_layout.addWidget(self.spin_windows)
@@ -1015,6 +1034,22 @@ class MainWindow(QMainWindow):
         self.valid_console.setVisible(tab_name == "Valid Email")
         self.invalid_console.setVisible(tab_name == "Invalid Email")
         self.lookup_console.setVisible(tab_name == "Lookup Email")
+        
+        # If user opens Valid tab and it's empty, attempt to load from valid.txt
+        if tab_name == "Valid Email" and not self.valid_console.toPlainText().strip():
+            try:
+                with open('valid.txt', 'r', encoding='utf-8') as f:
+                    for line in f:
+                        ln = line.strip()
+                        if ln:
+                            self.valid_console.append(ln)
+                            if ln.startswith('✅ VALID - '):
+                                email = ln.split('✅ VALID - ')[1].strip()
+                                if email not in self.valid_emails:
+                                    self.valid_emails.append(email)
+            except Exception:
+                pass
+
         # If user opens Invalid tab and it's empty, attempt to load from invalid.txt
         if tab_name == "Invalid Email" and not self.invalid_console.toPlainText().strip():
             try:
