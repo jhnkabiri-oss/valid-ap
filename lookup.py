@@ -307,4 +307,10 @@ def main():
     print("=" * 60)
 
 if __name__ == "__main__":
+    try:
+        import multiprocessing
+        if getattr(sys, 'frozen', False):
+            multiprocessing.freeze_support()
+    except Exception:
+        pass
     main()

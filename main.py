@@ -1,4 +1,6 @@
 import sys
+import multiprocessing
+import os
 import re
 import logging
 import threading
@@ -7,15 +9,36 @@ from functools import partial
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QLabel, QFrame, 
                                QTextEdit, QListWidget, QListWidgetItem, QProgressBar, QSpinBox,
-                               QMessageBox, QFileDialog)
+                               QMessageBox, QFileDialog, QCheckBox)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
+import signal
+import subprocess
+import os
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QFont, QColor
 
 # Import backends with auto-reload
 import importlib
+import logging as _logging
+import tempfile as _tempfile
+_log_handler = None
+try:
+    if getattr(sys, 'frozen', False):
+        # When frozen, write a log file next to the executable for troubleshooting
+        exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
+        log_file_path = os.path.join(exe_dir, 'validcyberroad_debug.log')
+        _log_handler = _logging.FileHandler(log_file_path, encoding='utf-8')
+        _log_handler.setFormatter(_logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        _logging.getLogger().setLevel(_logging.DEBUG)
+        _logging.getLogger().addHandler(_log_handler)
+        print(f"📝 Debug log created: {log_file_path}")
+except Exception:
+    pass
 try:
     import ap
-    importlib.reload(ap)  # Auto-reload to get latest changes
+    # Auto-reload when not frozen (helps during development); avoid reload for frozen executables
+    if not getattr(sys, 'frozen', False):
+        importlib.reload(ap)
     from ap import AfterPayBatchProcessor, AfterPayBatchValidator
     AP_AVAILABLE = True
     print("✅ ap.py auto-reloaded successfully")
@@ -25,7 +48,9 @@ except Exception as e:
 
 try:
     import lookup
-    importlib.reload(lookup)  # Auto-reload 
+    # Auto-reload when not frozen (helps during development); avoid reload for frozen executables
+    if not getattr(sys, 'frozen', False):
+        importlib.reload(lookup)
     from lookup import PeopleDataLabsLookup, extract_person_info, format_output, append_to_lookup_file
     LOOKUP_AVAILABLE = True
     print("✅ lookup.py auto-reloaded successfully")
@@ -158,7 +183,7 @@ class ValidationThread(QThread):
     summary = Signal(object)
     finished = Signal()
 
-    def __init__(self, emails, num_browsers=1, headless=False):
+    def __init__(self, emails, num_browsers=1, headless=False, stagger_between_browsers: float = 1.2):
         super().__init__()
         self.emails = emails
         self.num_browsers = num_browsers
@@ -170,6 +195,7 @@ class ValidationThread(QThread):
         self._valid = 0
         self._invalid = 0
         self._processing = 0
+        self.stagger_between_browsers = stagger_between_browsers
 
     def run(self):
         # Attach our logging handler to 'ap' logger if available
@@ -194,7 +220,7 @@ class ValidationThread(QThread):
                 self._processing += 1
                 self.email_processing_started.emit(email, browser_id)
 
-            processor = AfterPayBatchProcessor(num_browsers=self.num_browsers, headless=self.headless, progress_callback=progress_callback, summary_callback=lambda s: self.summary.emit(s), stop_event=self._stop_event)
+            processor = AfterPayBatchProcessor(num_browsers=self.num_browsers, headless=self.headless, progress_callback=progress_callback, summary_callback=lambda s: self.summary.emit(s), stop_event=self._stop_event, stagger_between_browsers=self.stagger_between_browsers)
             # Provide a restart callback so GUI can log and display browser restarts
             try:
                 def _restart_cb(browser_id, attempt, reason, old_pid=None):
@@ -231,6 +257,15 @@ class ValidationThread(QThread):
 
     def stop(self):
         self._stop_event.set()
+        # Also ask underlying processor to stop (if already created)
+        try:
+            if hasattr(self, '_processor') and self._processor:
+                try:
+                    self._processor.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def pause(self):
         # Pause the underlying processor threads
@@ -315,8 +350,14 @@ class LookupThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    _inst_count = 0
     def __init__(self):
         super().__init__()
+        try:
+            MainWindow._inst_count += 1
+            print(f"🔎 MainWindow.__init__ called - instance #{MainWindow._inst_count}")
+        except Exception:
+            pass
         self.setWindowTitle("Email Validator Pro V4")
         self.resize(1280, 850)
         self.setStyleSheet(STYLE_MAIN_BG)
@@ -476,10 +517,27 @@ class MainWindow(QMainWindow):
         lbl_win = QLabel("Windows Tab")
         lbl_win.setStyleSheet("color: white; font-weight: bold; font-size: 13px;")
         
-        self.spin_windows = ModernStepper(min_val=1, max_val=20, initial_val=5)
+        # Safe mode: conver to 1 browser for release/frozen builds to prevent resource problems
+        default_safe_mode = getattr(sys, 'frozen', False)
+        # CLI overrides
+        if '--safe-mode' in sys.argv:
+            default_safe_mode = True
+        if '--no-safe-mode' in sys.argv:
+            default_safe_mode = False
+        self.spin_windows = ModernStepper(min_val=1, max_val=20, initial_val=1 if default_safe_mode else 5)
+        self.chk_safe_mode = QCheckBox("Safe Mode (1 browser)")
+        self.chk_safe_mode.setStyleSheet("color: white; margin-top: 6px;")
+        self.chk_safe_mode.setChecked(default_safe_mode)
+        self.chk_safe_mode.toggled.connect(self.on_safe_mode_toggled)
+        # Option to start all browsers together (no stagger)
+        self.chk_start_together = QCheckBox("Start browsers together")
+        self.chk_start_together.setStyleSheet("color: white; margin-top: 6px;")
+        self.chk_start_together.setChecked(False)
         
         win_layout.addWidget(lbl_win)
         win_layout.addWidget(self.spin_windows)
+        win_layout.addWidget(self.chk_safe_mode)
+        win_layout.addWidget(self.chk_start_together)
         
         controls_layout.addLayout(win_layout)
         
@@ -525,7 +583,7 @@ class MainWindow(QMainWindow):
         
         self.btn_start_validate = StyledButton("Start Validate", BTN_GREEN, width=140)
         self.btn_pause_validate = StyledButton("Pause Validate", BTN_GREY, width=140)
-        self.btn_stop_validate = StyledButton("Stop Validate", BTN_RED, width=140)
+        self.btn_stop_validate = StyledButton("Force Stop & Kill", BTN_RED, width=160)
         self.btn_pause_validate.setEnabled(False)
         bottom_layout.addWidget(self.btn_start_validate)
         bottom_layout.addWidget(self.btn_pause_validate)
@@ -567,7 +625,7 @@ class MainWindow(QMainWindow):
         self.btn_lookup_email.clicked.connect(lambda: self.switch_tab("Lookup Email"))
         
         self.btn_start_validate.clicked.connect(self.start_validation)
-        self.btn_stop_validate.clicked.connect(self.stop_validation)
+        self.btn_stop_validate.clicked.connect(self.force_stop_validation)
         self.btn_pause_validate.clicked.connect(self.pause_resume_validation)
         self.btn_lookup_data.clicked.connect(self.start_lookup)
         self.btn_pause_lookup.clicked.connect(self.pause_resume_lookup)
@@ -582,6 +640,8 @@ class MainWindow(QMainWindow):
         self.current_tab = "Logger"
         self.browser_restart_counts = {}
         self.restart_labels = []
+        # Single-instance server reference (keeps socket alive)
+        self._single_instance_server = None
 
         # Connect thread signals
         # Load existing invalid results from file into invalid console
@@ -627,7 +687,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please load an email list first")
             return
 
-        num_browsers = self.spin_windows.value()
+        num_browsers = 1 if (hasattr(self, 'chk_safe_mode') and self.chk_safe_mode.isChecked()) else self.spin_windows.value()
+        # If start together option set, use zero stagger so browsers appear together
+        stagger = 0 if (hasattr(self, 'chk_start_together') and self.chk_start_together.isChecked()) else 1.2
         self.btn_start_validate.setEnabled(False)
         self.btn_stop_validate.setEnabled(True)
         self.btn_lookup_data.setEnabled(False)
@@ -636,7 +698,7 @@ class MainWindow(QMainWindow):
         self.pbar.setMaximum(len(emails))
         self.pbar.setValue(0)
 
-        self.validation_thread = ValidationThread(emails, num_browsers=num_browsers, headless=False)
+        self.validation_thread = ValidationThread(emails, num_browsers=num_browsers, headless=False, stagger_between_browsers=stagger)
         self.validation_thread.progress.connect(self.on_progress_updated)
         self.validation_thread.log.connect(self.log_message)
         self.validation_thread.email_processed.connect(self.on_email_processed)
@@ -677,16 +739,206 @@ class MainWindow(QMainWindow):
         """Request stop for validation"""
         if self.validation_thread:
             self.log_message("🛑 Stop requested - closing all browsers...")
-            self.validation_thread.stop()
+            # Ask ValidationThread to stop and also ask the underlying processor to stop
+            try:
+                self.validation_thread.stop()
+            except Exception:
+                pass
+            try:
+                if hasattr(self.validation_thread, '_processor') and self.validation_thread._processor:
+                    self.validation_thread._processor.stop()
+            except Exception:
+                pass
             self.log_message("⏹️ Stopping validation...")
+            # Requeue any remaining emails from the processor back to the list so user can start again
+            try:
+                proc = getattr(self.validation_thread, '_processor', None)
+                if proc and getattr(proc, 'email_queue', None):
+                    try:
+                        # queue.Queue uses a deque internally at .queue
+                        remaining = list(proc.email_queue.queue)
+                        if remaining:
+                            # Add back to the GUI list preserving order and avoiding duplicates
+                            existing = {self.email_list.item(i).text().split('. ', 1)[1] if '. ' in self.email_list.item(i).text() else self.email_list.item(i).text() for i in range(self.email_list.count())}
+                            # Insert at the top or bottom? We'll append at the end
+                            idx_start = self.email_list.count() + 1
+                            for i, em in enumerate(remaining, idx_start):
+                                if em not in existing:
+                                    item = QListWidgetItem(f"{i:02d}. {em}")
+                                    item.setData(Qt.UserRole, em)
+                                    self.email_list.addItem(item)
+                            # Clear the processor queue to prevent duplicates when restarting
+                            try:
+                                try:
+                                    proc.email_queue.queue.clear()
+                                except Exception:
+                                    # Fallback: drain using get_nowait
+                                    while not proc.email_queue.empty():
+                                        try:
+                                            proc.email_queue.get_nowait()
+                                        except Exception:
+                                            break
+                            except Exception:
+                                pass
+                            self.log_message(f"🔁 Requeued {len(remaining)} emails into the list for restarting")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             # Disable buttons during cleanup
             self.btn_start_validate.setEnabled(False)
             self.btn_stop_validate.setEnabled(False)
             # Reset pause button state
             self.btn_pause_validate.setText("Pause Validate")
             self.btn_pause_validate.setEnabled(False)
+            # Start a watchdog timer to ensure the thread finishes and UI gets reset.
+            try:
+                if hasattr(self, '_validation_stop_timer') and self._validation_stop_timer is not None:
+                    try:
+                        self._validation_stop_timer.stop()
+                    except Exception:
+                        pass
+                self._validation_stop_count = 0
+                self._validation_stop_timer = QTimer(self)
+                self._validation_stop_timer.setInterval(500)
+                def _check_stop():
+                    try:
+                        # If thread is None or finished, cleanup will occur via on_validation_finished
+                        if not self.validation_thread:
+                            try:
+                                self._validation_stop_timer.stop()
+                            except Exception:
+                                pass
+                            return
+                        # If thread is still running, increment watchdog counter
+                        self._validation_stop_count += 1
+                        if self._validation_stop_count > 20:  # ~10 seconds timeout
+                            try:
+                                self._validation_stop_timer.stop()
+                            except Exception:
+                                pass
+                            self.log_message("⚠️ Validation stop timed out; forcing UI cleanup")
+                            # Force stop on processor again if still present
+                            try:
+                                if hasattr(self.validation_thread, '_processor') and self.validation_thread._processor:
+                                    self.validation_thread._processor.stop()
+                            except Exception:
+                                pass
+                            # Attempt to forcibly cleanup references to allow restart
+                            try:
+                                self.validation_thread = None
+                            except Exception:
+                                pass
+                            # Manually call on_validation_finished to reset UI state
+                            try:
+                                self.on_validation_finished()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                self._validation_stop_timer.timeout.connect(_check_stop)
+                self._validation_stop_timer.start()
+            except Exception:
+                pass
         else:
             self.log_message("⚠️ No validation running")
+
+    def force_stop_validation(self):
+        """Force stop validation and kill browser processes associated with the current processor.
+        This attempts a graceful stop first, then force-kills driver processes (children) using psutil or platform fallbacks.
+        """
+        if not self.validation_thread:
+            self.log_message("⚠️ No validation running to force-stop")
+            return
+
+        # Confirm with the user
+        try:
+            ans = QMessageBox.question(self, "Force Stop & Kill", "Force stop validation and kill all browser processes? This may close browser windows immediately.", QMessageBox.Yes | QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                self.log_message("ℹ️ Force stop cancelled by user")
+                return
+        except Exception:
+            # fallback if dialog fails
+            pass
+
+        self.log_message("🛑 Force-stop requested - killing browsers...")
+
+        # Ask normal stop first (this also enqueues remaining emails back to list)
+        try:
+            try:
+                self.stop_validation()
+            except Exception:
+                # fallback to direct stop
+                self.validation_thread.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.validation_thread, '_processor') and self.validation_thread._processor:
+                try:
+                    self.validation_thread._processor.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Kill tracked browser PIDs if any
+        try:
+            proc = getattr(self.validation_thread, '_processor', None)
+            pids = {}
+            if proc:
+                try:
+                    with proc._pid_lock:
+                        pids = dict(proc.browser_pids)
+                except Exception:
+                    pids = dict(proc.browser_pids) if hasattr(proc, 'browser_pids') else {}
+
+            for bid, pid in pids.items():
+                try:
+                    self.log_message(f"⚠️ Killing driver PID {pid} for browser {bid}...")
+                    self._kill_pid_tree(pid)
+                except Exception as e:
+                    self.log_message(f"⚠️ Could not kill PID {pid}: {e}")
+
+            # Attempt to cleanup orphan drivers if method exists
+            try:
+                if proc and hasattr(proc, 'cleanup_orphan_drivers'):
+                    proc.cleanup_orphan_drivers()
+            except Exception:
+                pass
+            try:
+                # Clear tracked pids
+                if proc:
+                    with proc._pid_lock:
+                        proc.browser_pids.clear()
+            except Exception:
+                pass
+            try:
+                # Clear email queue safely so restart starts fresh with requeued items
+                if proc and getattr(proc, 'email_queue', None):
+                    try:
+                        proc.email_queue.queue.clear()
+                    except Exception:
+                        while not proc.email_queue.empty():
+                            try:
+                                proc.email_queue.get_nowait()
+                            except Exception:
+                                break
+            except Exception:
+                pass
+        except Exception as e:
+            self.log_message(f"⚠️ Error during force-stop kill: {e}")
+
+        # Force UI cleanup
+        try:
+            # Ensure validation thread reference removed and UI reset
+            try:
+                self.validation_thread = None
+            except Exception:
+                pass
+            self.on_validation_finished()
+            self.log_message("🧹 Force-stop complete")
+        except Exception as e:
+            self.log_message(f"⚠️ Error finalizing force-stop: {e}")
 
     def pause_resume_validation(self):
         """Toggle pause/resume for validation"""
@@ -695,12 +947,21 @@ class MainWindow(QMainWindow):
             return
         try:
             # Toggle pause/resume on ValidationThread which proxies to the processor
-            if hasattr(self.validation_thread, '_pause_event') and not self.validation_thread._pause_event.is_set():
-                self.validation_thread.pause()
+            if hasattr(self.validation_thread, '_pause_event'):
+                is_paused = self.validation_thread._pause_event.is_set()
+            else:
+                is_paused = False
+
+            if not is_paused:
+                # Pause
+                if hasattr(self.validation_thread, 'pause'):
+                    self.validation_thread.pause()
                 self.btn_pause_validate.setText("Resume Validate")
                 self.log_message("⏸️ Validation paused")
             else:
-                self.validation_thread.resume()
+                # Resume
+                if hasattr(self.validation_thread, 'resume'):
+                    self.validation_thread.resume()
                 self.btn_pause_validate.setText("Pause Validate")
                 self.log_message("▶️ Validation resumed")
         except Exception as e:
@@ -787,6 +1048,12 @@ class MainWindow(QMainWindow):
                 pass
             # Log it in the GUI
             self.log_message(f"🔁 Browser {browser_id} restarted (attempt {attempt}) reason: {reason} old_pid:{old_pid}")
+            # For create errors, show a non-blocking warning to the user (first time only to avoid spam)
+            try:
+                if reason and 'create_failed' in str(reason).lower() and cnt == 1:
+                    QMessageBox.warning(self, "Browser startup failed", f"Browser {browser_id} failed to start: {reason}\nSee debug log for details.")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -824,6 +1091,44 @@ class MainWindow(QMainWindow):
         
         self.log_message("🧹 Cleanup complete")
 
+    def _kill_pid_tree(self, pid):
+        """Kill a process tree for given pid. Uses psutil if available, fallback to platform commands."""
+        try:
+            import psutil
+            try:
+                p = psutil.Process(pid)
+                for c in p.children(recursive=True):
+                    try:
+                        c.kill()
+                    except Exception:
+                        pass
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                return
+            except psutil.NoSuchProcess:
+                return
+        except Exception:
+            pass
+
+        # fallback
+        try:
+            if sys.platform == 'win32':
+                subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], check=False)
+            else:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def on_browser_ready(self, browser_id, pid):
         """Handle GUI update when a browser is confirmed ready"""
         try:
@@ -845,6 +1150,23 @@ class MainWindow(QMainWindow):
             self.log_message(f"✅ Browser {browser_id} ready (pid:{pid})")
         except Exception:
             pass
+
+    def on_safe_mode_toggled(self, checked):
+        """Handle Safe Mode toggle: if enabled, force 1 browser and disable stepper controls"""
+        try:
+            if checked:
+                # Force 1 browser
+                self.spin_windows.current_val = 1
+                self.spin_windows.lbl_value.setText('1')
+                self.spin_windows.btn_minus.setEnabled(False)
+                self.spin_windows.btn_plus.setEnabled(False)
+                self.log_message("⚙️ Safe Mode enabled: Using 1 browser")
+            else:
+                self.spin_windows.btn_minus.setEnabled(True)
+                self.spin_windows.btn_plus.setEnabled(True)
+                self.log_message("⚙️ Safe Mode disabled")
+        except Exception as e:
+            self.log_message(f"⚠️ Error toggling Safe Mode: {e}")
 
     def get_valid_emails_for_lookup(self):
         """Return a deduplicated list of valid emails for lookup.
@@ -1175,9 +1497,64 @@ class MainWindow(QMainWindow):
 
 if __name__ == '__main__':
     # Prevent creating multiple QApplication or MainWindow instances if module is reloaded
+    # When running as a frozen/executable build (PyInstaller), child processes
+    # that use multiprocessing may import this script again. Calling
+    # multiprocessing.freeze_support() prevents the frozen executable from
+    # re-running the startup code in spawned child processes.
+    try:
+        if getattr(sys, 'frozen', False):
+            multiprocessing.freeze_support()
+    except Exception:
+        pass
+    # Debug: print PID and frozen state to help diagnose multiple-window startup
+    try:
+        print(f"🛠️ Starting main: PID={os.getpid()} frozen={getattr(sys, 'frozen', False)}")
+    except Exception:
+        pass
+
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+
+    # Single-instance guard (enabled by default). Use --no-single-instance CLI option to disable.
+    disabled_single_guard = '--no-single-instance' in sys.argv or '--allow-multiple-instances' in sys.argv
+    try:
+        if not disabled_single_guard:
+            server_name = 'validcyberroad_single_instance'
+            # Check existing instance by trying to connect to server
+            temp_socket = QLocalSocket()
+            temp_socket.connectToServer(server_name)
+            if temp_socket.waitForConnected(100):
+                # Another instance running; inform user and exit
+                try:
+                    QMessageBox.warning(None, 'Already Running', 'ValidCyberRoad is already running in another instance.')
+                except Exception:
+                    print('ValidCyberRoad already running (no GUI available).')
+                sys.exit(0)
+            else:
+                # No existing instance; start server to claim single-instance
+                # Try to remove stale socket first
+                try:
+                    QLocalServer.removeServer(server_name)
+                except Exception:
+                    pass
+                single_server = QLocalServer()
+                try:
+                    single_server.listen(server_name)
+                    # Keep reference on window so it doesn't get garbage-collected
+                    # and our server stays alive
+                    # We also attach to window later; if existing_main reuses, attach there
+                except Exception:
+                    # Non-fatal: proceed anyway
+                    pass
+                # Save reference to prevent GC
+                # Keep server reference attached to app to persist for lifetime
+                try:
+                    app._single_instance_server = single_server
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     # If a MainWindow already exists among top-level widgets, restore and focus it
     existing_main = None

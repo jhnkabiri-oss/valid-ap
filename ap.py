@@ -201,13 +201,13 @@ class AfterPayBatchValidator:
                 except Exception:
                     pass
             except Exception as e1:
-                logger.warning(f"Method 1 failed: {e1}")
+                logger.exception(f"Method 1 failed: {e1}")
                 try:
                     # Method 2: With use_subprocess=False
                     self.driver = uc.Chrome(options=options, version_main=None, use_subprocess=False)
                     logger.debug("✅ Chrome driver created (Method 2)")
                 except Exception as e2:
-                    logger.warning(f"Method 2 failed: {e2}")
+                    logger.exception(f"Method 2 failed: {e2}")
                     # Method 3: Regular selenium as fallback
                     from selenium import webdriver
                     regular_options = webdriver.ChromeOptions()
@@ -286,7 +286,7 @@ class AfterPayBatchValidator:
                     logger.warning(f"⚠️ Error reading window handles: {e}")
                     wh = []
                 if not wh:
-                    logger.error("❌ Driver created but no window handles present; treating as not ready")
+                    logger.exception("❌ Driver created but no window handles present; treating as not ready")
                     try:
                         self.driver.quit()
                     except Exception:
@@ -321,7 +321,7 @@ class AfterPayBatchValidator:
                 raise
             
         except Exception as e:
-            logger.error(f"❌ Error creating driver: {e}")
+            logger.exception(f"❌ Error creating driver: {e}")
             raise
     
     def validate_email(self, email, timeout=60):
@@ -795,7 +795,7 @@ class AfterPayBatchProcessor:
                                 pass
                             validator = None
                     except Exception as e1:
-                        logger.warning(f"⚠️ Could not create validator (attempt {attempt}): {e1}")
+                        logger.exception(f"⚠️ Could not create validator (attempt {attempt}): {e1}")
                         try:
                             if validator:
                                 validator.close()
@@ -808,6 +808,12 @@ class AfterPayBatchProcessor:
 
                 if not validator:
                     logger.error(f"❌ Could not create a ready validator for browser {browser_id} after {max_startup_attempts} attempts; sleeping and retrying...")
+                    # Inform GUI via restart callback (so it can show a warning)
+                    try:
+                        if callable(self.restart_callback):
+                            self.restart_callback(browser_id, 0, f"create_failed: could not create validator after {max_startup_attempts} attempts", None)
+                    except Exception:
+                        pass
                     time.sleep(5)
                     continue
                 # We've got a ready validator; break startup loop to process emails
@@ -820,7 +826,13 @@ class AfterPayBatchProcessor:
                         validator = AfterPayBatchValidator(headless=self.headless, window_position=window_position)
                         logger.debug(f"🔁 Recreated validator for browser {browser_id}")
                     except Exception as e:
-                        logger.warning(f"⚠️ Could not recreate validator for browser {browser_id}: {e}")
+                        logger.exception(f"⚠️ Could not recreate validator for browser {browser_id}: {e}")
+                        # Notify GUI that creation failed for this browser
+                        try:
+                            if callable(self.restart_callback):
+                                self.restart_callback(browser_id, 0, f"create_failed: could not recreate validator: {e}", None)
+                        except Exception:
+                            pass
                         time.sleep(0.5)
                         continue
                 # Pause functionality: if pause is requested, block here until resumed or stopped
@@ -1259,4 +1271,10 @@ def main():
     processor.process_emails(emails)
 
 if __name__ == "__main__":
+    try:
+        import multiprocessing
+        if getattr(sys, 'frozen', False):
+            multiprocessing.freeze_support()
+    except Exception:
+        pass
     main()
