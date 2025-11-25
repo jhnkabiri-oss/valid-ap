@@ -7,7 +7,6 @@ Menggunakan list.txt untuk input email dan save ke valid.txt & invalid.txt
 
 import time
 import subprocess
-import signal
 import logging
 import threading
 from queue import Queue
@@ -20,6 +19,7 @@ except Exception:
     PSUTIL_AVAILABLE = False
 import shutil
 import os
+import sys
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -58,23 +58,38 @@ def classify_page(final_url: str, page_source: str):
     fu = (final_url or '').lower()
     ps = (page_source or '').lower()
 
-    # Highest priority: detection markers - be more aggressive
-    for m in BOT_DETECTION_MARKERS:
-        if m in fu or m in ps:
-            logger.warning(f"🤖 Bot detection marker found: '{m}' - Browser needs restart!")
-            return False, False, True, f"detected_marker:{m}"
+    # Check for password page (valid account) - HIGHEST PRIORITY for VALID
+    # Logic: If URL contains /password, it is VALID.
+    if '/password' in fu:
+        return True, False, False, 'url_contains_password'
 
-    # Check for password page (valid account)
-    if '/password' in fu or 'input type=\'password\'' in ps or 'input type="password"' in ps or 'name="password"' in ps:
-        return True, False, False, 'password_page'
+    if 'input type=\'password\'' in ps or 'input type="password"' in ps or 'name="password"' in ps:
+        return True, False, False, 'password_field_found'
 
-    # Common invalid markers
+    # Common invalid markers - Check these BEFORE detection markers
+    # These are explicit messages that mean the account doesn't exist
     invalid_markers = [
-        'account not found', "we couldn't find", "couldn't find", 'no account', 'not registered', 'no user found'
+        'account not found', "we couldn't find", "couldn't find", 'no account', 
+        'not registered', 'no user found', 'email not found', 'invalid email'
     ]
     for im in invalid_markers:
         if im in ps:
             return False, True, False, f"invalid_marker:{im}"
+
+    # Detection markers - BUT exclude "an unknown error occurred" and "please try again" here
+    # because those are handled separately and trigger browser restart
+    detection_markers_filtered = [m for m in BOT_DETECTION_MARKERS 
+                                   if m not in ['an unknown error occurred', 'unknown error occurred', 'please try again']]
+    
+    for m in detection_markers_filtered:
+        if m in fu or m in ps:
+            logger.warning(f"🤖 Bot detection marker found: '{m}' - Browser needs restart!")
+            return False, False, True, f"detected_marker:{m}"
+
+    # Check for "unknown error" - this should trigger detection/restart
+    if 'an unknown error occurred' in ps or 'unknown error occurred' in ps:
+        logger.warning(f"🤖 Unknown error detected - Browser needs restart!")
+        return False, False, True, "detected_marker:unknown_error"
 
     # Do not classify 'signin' or 'login' as invalid by default; rely on password field or explicit messages instead
 
@@ -82,14 +97,33 @@ def classify_page(final_url: str, page_source: str):
     return False, True, False, 'fallback_invalid'
 
 
+def save_email_result(email, status, url=None):
+    """Save email result to appropriate file"""
+    try:
+        if status == 'valid':
+            filename = 'valid.txt'
+            message = f"✅ VALID - {email}\n"
+        else:
+            filename = 'invalid.txt'
+            message = f"❌ INVALID - {email}\n"
+        
+        with open(filename, 'a', encoding='utf-8') as f:
+            f.write(message)
+        logger.debug(f"💾 Saved to {filename}: {email}")
+        
+    except Exception as e:
+        logger.error(f"❌ Error saving to file: {e}")
+
+
 class AfterPayBatchValidator:
     """AfterPay Email Batch Validator with 500x500 window"""
     
-    def __init__(self, headless=False, random_profile=False):
+    def __init__(self, headless=False, random_profile=False, window_position=None):
         self.driver = None
         self.headless = headless
         self.random_profile = random_profile
         self.profile_dir = None
+        self.window_position = window_position
         self.create_driver()
     
     def create_driver(self):
@@ -107,6 +141,9 @@ class AfterPayBatchValidator:
             options.add_argument('--disable-web-security')
             options.add_argument('--allow-running-insecure-content')
             options.add_argument('--disable-features=VizDisplayCompositor')
+            options.add_argument('--no-first-run')
+            options.add_argument('--no-service-autorun')
+            options.add_argument('--password-store=basic')
             
             # macOS specific security bypass
             options.add_argument('--remote-debugging-port=0')
@@ -117,6 +154,11 @@ class AfterPayBatchValidator:
             # Window size - Set to 500x500
             options.add_argument('--window-size=500,500')
             
+            # Set window position if provided
+            if self.window_position:
+                x, y = self.window_position
+                options.add_argument(f'--window-position={x},{y}')
+            
             if self.headless:
                 options.add_argument('--headless=new')
 
@@ -125,7 +167,7 @@ class AfterPayBatchValidator:
                 try:
                     self.profile_dir = tempfile.mkdtemp(prefix="ap_profile_")
                     options.add_argument(f"--user-data-dir={self.profile_dir}")
-                    logger.info(f"🔐 Using random profile dir: {self.profile_dir}")
+                    logger.debug(f"🔐 Using random profile dir: {self.profile_dir}")
                 except Exception as e:
                     logger.warning(f"⚠️ Could not create random profile dir: {e}")
             
@@ -140,7 +182,7 @@ class AfterPayBatchValidator:
             for path in chrome_paths:
                 if os.path.exists(path):
                     chrome_binary = path
-                    logger.info(f"🔍 Found system Chrome: {path}")
+                    logger.debug(f"🔍 Found system Chrome: {path}")
                     break
             
             if chrome_binary:
@@ -150,12 +192,12 @@ class AfterPayBatchValidator:
             try:
                 # Method 1: Normal undetected chrome
                 self.driver = uc.Chrome(options=options, version_main=None)
-                logger.info("✅ Chrome driver created (Method 1)")
+                logger.debug("✅ Chrome driver created (Method 1)")
                 try:
                     svc = getattr(self.driver, 'service', None)
                     proc = getattr(svc, 'process', None) if svc else None
                     if proc and getattr(proc, 'pid', None):
-                        logger.info(f"🔎 Driver PID: {proc.pid}")
+                        logger.debug(f"🔎 Driver PID: {proc.pid}")
                 except Exception:
                     pass
             except Exception as e1:
@@ -163,7 +205,7 @@ class AfterPayBatchValidator:
                 try:
                     # Method 2: With use_subprocess=False
                     self.driver = uc.Chrome(options=options, version_main=None, use_subprocess=False)
-                    logger.info("✅ Chrome driver created (Method 2)")
+                    logger.debug("✅ Chrome driver created (Method 2)")
                 except Exception as e2:
                     logger.warning(f"Method 2 failed: {e2}")
                     # Method 3: Regular selenium as fallback
@@ -176,49 +218,65 @@ class AfterPayBatchValidator:
                     if chrome_binary:
                         regular_options.binary_location = chrome_binary
                     self.driver = webdriver.Chrome(options=regular_options)
-                    logger.info("✅ Chrome driver created (Fallback)")
+                    logger.debug("✅ Chrome driver created (Fallback)")
             
             # Small delay after creation
-            time.sleep(2)
+            time.sleep(0.5)
             
-            # Set timeouts to prevent hanging
+            # Ensure we have a valid window handle before proceeding
+            # Retry a few times if window is not immediately available
+            for _ in range(5):
+                try:
+                    if self.driver.window_handles:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
             try:
-                self.driver.set_page_load_timeout(20)
-                self.driver.set_script_timeout(20)
+                if not self.driver.window_handles:
+                    logger.debug("⚠️ No window handles found, attempting to create one...")
+                    self.driver.execute_script("window.open('');")
+                    time.sleep(0.5)
             except Exception:
                 pass
 
-            # Set window size explicitly after creation
+            # Set timeouts to prevent hanging - Increased for slow connections
             try:
-                self.driver.set_window_size(500, 500)
-                logger.info("🖥️ Window size set to 500x500")
-            except Exception as e:
-                logger.warning(f"Could not set window size: {e}")
-                msg = str(e).lower()
-                # Treat specific window errors as fatal so caller can recreate driver
-                if 'no such window' in msg or 'web view not found' in msg or 'target window already closed' in msg:
-                    logger.error(f"❌ Fatal driver error when setting window size: {e}")
-                    # Close and raise to force a re-create upstream
-                    try:
-                        if hasattr(self, 'driver') and self.driver:
-                            try:
-                                self.driver.quit()
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    raise
-                else:
-                    logger.warning(f"Could not set window size: {e}")
-            # Ensure the driver is really usable by checking portal load
-            try:
-                if not self.wait_until_ready(timeout=20):
-                    logger.warning("⚠️ Driver created but did not become ready in the allotted time")
-                    raise WebDriverException("Driver not ready")
-            except Exception as e:
-                # bubble up to the caller which will decide how to recover
-                logger.error(f"❌ Driver readiness check failed: {e}")
-                raise
+                self.driver.set_page_load_timeout(90)
+                self.driver.set_script_timeout(90)
+            except Exception:
+                pass
+
+            # Set window size explicitly after creation with retry
+            for _ in range(3):
+                try:
+                    self.driver.set_window_size(500, 500)
+                    if self.window_position:
+                        x, y = self.window_position
+                        self.driver.set_window_position(x, y)
+                        logger.debug(f"🖥️ Window position set to {x},{y}")
+                    logger.debug("🖥️ Window size set to 500x500")
+                    break
+                except Exception as e:
+                    msg = str(e).lower()
+                    if 'no such window' in msg or 'web view not found' in msg:
+                        logger.warning(f"⚠️ Window not ready yet, retrying resize... ({e})")
+                        time.sleep(0.5)
+                        # Try to switch to the first window if possible
+                        try:
+                            if self.driver.window_handles:
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                        except Exception:
+                            pass
+                    else:
+                        logger.warning(f"Could not set window size: {e}")
+                        break
+            
+            # REMOVED: Redundant wait_until_ready call here. 
+            # The worker thread calls wait_until_ready immediately after creation.
+            # This speeds up the 'creation' phase and lets the worker handle readiness timeouts.
+            
             # Verify driver has at least one window handle; if none, fail fast for recreate
             try:
                 wh = []
@@ -266,152 +324,192 @@ class AfterPayBatchValidator:
             logger.error(f"❌ Error creating driver: {e}")
             raise
     
-    def save_to_file(self, email, status, url):
-        """Save email result to appropriate file"""
-        try:
-            if status == 'valid':
-                filename = 'valid.txt'
-                message = f"✅ VALID - {email}\n"
-            else:
-                filename = 'invalid.txt'
-                message = f"❌ INVALID - {email}\n"
-            
-            with open(filename, 'a', encoding='utf-8') as f:
-                f.write(message)
-            logger.info(f"💾 Saved to {filename}: {email}")
-            
-        except Exception as e:
-            logger.error(f"❌ Error saving to file: {e}")
-    
-    def validate_email(self, email, timeout=15):
+    def validate_email(self, email, timeout=60):
         """Validate single email"""
-        try:
-            logger.info(f"🔍 Testing: {email}")
-            
-            # Go to AfterPay portal
-            logger.info("🌐 Opening AfterPay portal...")
-            self.driver.get("https://portal.afterpay.com/en-US")
-            
-            # Wait for and find email input
-            email_input = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email']"))
-            )
-            logger.info("📧 Found email input")
-            
-            # Wait a bit for page to fully load
-            time.sleep(2)
-            
-            # Clear and type email
-            email_input.clear()
-            for char in email:
-                email_input.send_keys(char)
-                time.sleep(0.02)
-            
-            logger.info(f"⌨️ Typed: {email}")
-            
-            # Find and click continue button
-            continue_button = WebDriverWait(self.driver, 2).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
-            )
-            logger.info("🔘 Found button")
-            
-            continue_button.click()
-            logger.info("👆 Clicked Continue")
-            
-            # Wait for page to load a bit
-            time.sleep(1.5)
-
-            # First try to detect presence of a password field using DOM elements (reliable indicator of valid account)
-            password_present = False
+        # No try/except block here, let exceptions bubble up to browser_worker
+        logger.debug(f"🔍 Testing: {email}")
+        
+        # Go to AfterPay portal
+        logger.debug("🌐 Opening AfterPay portal...")
+        self.driver.get("https://portal.afterpay.com/en-US")
+        
+        # Wait for and find email input
+        email_input = WebDriverWait(self.driver, 60).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email']"))
+        )
+        logger.debug("📧 Found email input")
+        
+        # Wait a bit for page to fully load
+        time.sleep(2)
+        
+        # Clear and type email
+        email_input.clear()
+        for char in email:
+            email_input.send_keys(char)
+            time.sleep(0.02)
+        
+        logger.debug(f"⌨️ Typed: {email}")
+        
+        # Find and click continue button
+        continue_button = WebDriverWait(self.driver, 30).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
+        )
+        logger.debug("🔘 Found button")
+        
+        # Capture initial URL to detect redirection
+        initial_url = self.driver.current_url
+        
+        continue_button.click()
+        logger.debug("👆 Clicked Continue")
+        
+        # IMPORTANT: Give page time to process the request before checking for errors
+        # This prevents false positives from transient loading states
+        logger.debug("⏳ Waiting for page to process (2s grace period)...")
+        time.sleep(2.0)  # Grace period to let page start processing
+        
+        # Wait for page transition (Valid -> Redirect, Invalid -> Error msg)
+        # Max wait 60 seconds total, checking every 0.2s (less aggressive)
+        early_invalid_marker = None
+        unknown_error_detected = False
+        unknown_error_count = 0  # Count how many times we see the error (must be persistent)
+        
+        logger.debug("🔍 Starting page transition monitoring...")
+        
+        for iteration in range(300):  # 300 * 0.2s = 60 seconds max
+            time.sleep(0.2)
             try:
-                pw_elem = WebDriverWait(self.driver, 3).until(
+                curr_url = self.driver.current_url
+                # Check if URL changed
+                if curr_url != initial_url:
+                    logger.debug(f"🔄 URL changed: {initial_url} -> {curr_url}")
+                    break # Found URL change, stop waiting
+                
+                src = self.driver.page_source.lower()
+                
+                # 2. Check for invalid markers FIRST (these are definitive and should not trigger restart)
+                if "account not found" in src:
+                    early_invalid_marker = "account not found"
+                    logger.debug("❌ Found 'account not found' marker")
+                    break
+                if "couldn't find" in src or "we couldn't find" in src:
+                    early_invalid_marker = "couldn't find"
+                    logger.debug("❌ Found 'couldn't find' marker")
+                    break
+                
+                # 1. Check for restart trigger (Unknown error) - BUT ONLY after initial grace period
+                # AND it must appear MULTIPLE times to avoid false positives
+                if iteration >= 10:  # Only start checking after 2+ seconds (10 * 0.2s)
+                    if "an unknown error occurred" in src or "unknown error occurred" in src:
+                        unknown_error_count += 1
+                        if unknown_error_count >= 3:  # Must see error 3 times in a row (0.6s persistent)
+                            logger.warning("⚠️ Persistent 'An unknown error occurred' detected. Triggering restart...")
+                            unknown_error_detected = True
+                            raise BrowserDetectedException("An unknown error occurred. Please try again (restart browser)")
+                    else:
+                        # Reset counter if error disappears (it was transient)
+                        if unknown_error_count > 0:
+                            logger.debug(f"ℹ️ Unknown error cleared (was seen {unknown_error_count} times)")
+                        unknown_error_count = 0
+
+            except BrowserDetectedException:
+                raise
+            except Exception:
+                pass
+
+        # First try to detect presence of a password field using DOM elements (reliable indicator of valid account)
+        password_present = False
+        if not early_invalid_marker:
+            try:
+                pw_elem = WebDriverWait(self.driver, 20).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password'], input[name='password']"))
                 )
                 if pw_elem:
                     password_present = True
             except TimeoutException:
                 password_present = False
-            
-            # Check final URL
-            final_url = self.driver.current_url
-            logger.info(f"🌐 Final URL: {final_url}")
+        
+        # Check final URL
+        final_url = self.driver.current_url
+        logger.debug(f"🌐 Final URL: {final_url}")
 
-            # Also check page content for bot detection/corruption and classify result
-            page_source = ''
-            try:
-                page_source = self.driver.page_source
-            except Exception:
-                pass
+        # Also check page content for bot detection/corruption and classify result
+        page_source = ''
+        try:
+            page_source = self.driver.page_source
+        except Exception:
+            pass
 
-            # Check specifically for "An unknown error occurred. Please try again."
-            if page_source and "An unknown error occurred. Please try again." in page_source:
-                logger.warning("⚠️ Detected 'An unknown error occurred'. Triggering hard reload (clear cache)...")
-                raise BrowserDetectedException("An unknown error occurred. Please try again.")
+        # Check specifically for "An unknown error occurred. Please try again."
+        # This indicates the browser needs restart, but ONLY if:
+        # 1. We didn't already detect it during polling (avoid duplicate detection)
+        # 2. We don't have an explicit invalid marker (account not found takes precedence)
+        # 3. The URL hasn't changed (if redirected to password page, ignore any transient errors)
+        if not early_invalid_marker and not unknown_error_detected and not password_present:
+            ps_lower = page_source.lower()
+            if "an unknown error occurred" in ps_lower or "unknown error occurred" in ps_lower:
+                # Only trigger restart if BOTH conditions: error message + still on same page
+                if "please try again" in ps_lower and final_url == initial_url:
+                    logger.warning("⚠️ Final check: Detected persistent 'An unknown error occurred'. Triggering browser restart...")
+                    raise BrowserDetectedException("An unknown error occurred. Please try again (restart browser)")
 
-            # Use DOM detection first; classify as valid if password input present
-            if password_present:
-                is_valid, is_invalid, is_detection, reason = True, False, False, 'password_field'
-            else:
-                is_valid, is_invalid, is_detection, reason = classify_page(final_url, page_source)
-                logger.info(f"🔎 Classification: valid={is_valid} invalid={is_invalid} detect={is_detection} reason={reason}")
+        # Use DOM detection first; classify as valid if password input present
+        if password_present:
+            is_valid, is_invalid, is_detection, reason = True, False, False, 'password_field'
+        elif early_invalid_marker:
+            # We found an invalid marker during the polling loop
+            is_valid, is_invalid, is_detection, reason = False, True, False, f'invalid_marker:{early_invalid_marker}'
+        else:
+            is_valid, is_invalid, is_detection, reason = classify_page(final_url, page_source)
+            
+            # Override: If URL changed and no explicit invalid/detection found, mark as valid
+            # Even if classify_page returned fallback_invalid, if URL changed, it's valid.
+            is_explicitly_invalid = is_invalid and reason.startswith('invalid_marker')
+            if not is_detection and not is_explicitly_invalid and final_url != initial_url:
+                is_valid = True
+                is_invalid = False
+                reason = 'url_changed_redirect'
+            
+            logger.debug(f"🔎 Classification: valid={is_valid} invalid={is_invalid} detect={is_detection} reason={reason}")
 
-                # If ambiguous fallback invalid, give it one quick retry to avoid false negatives
-                if is_invalid and reason == 'fallback_invalid':
-                    logger.info(f"⚠️ Ambiguous result for {email}, re-checking once before marking invalid...")
-                    time.sleep(1.5)
-                    final_url = self.driver.current_url
-                    try:
-                        page_source = self.driver.page_source
-                    except Exception:
-                        page_source = ''
-                    is_valid2, is_invalid2, is_detection2, reason2 = classify_page(final_url, page_source)
-                    logger.info(f"🔁 Re-check classification: valid={is_valid2} invalid={is_invalid2} detect={is_detection2} reason={reason2}")
-                    # keep detection if seen
-                    if is_detection2:
-                        raise WebDriverException(f"Browser detected/blocked due to: {reason2}")
-                    is_valid, is_invalid, is_detection, reason = is_valid2, is_invalid2, is_detection2, reason2
-            if is_detection:
-                logger.error(f"❗ Browser blocked/detected (reason={reason}) for {email}")
-                # Raise our custom exception so caller can distinguish detection vs other webdriver errors
-                raise BrowserDetectedException(f"Browser detected/blocked due to: {reason}")
-            
-            # Determine if valid/invalid
-            # We already used classify_page; use its results
-            
-            if is_valid:
-                logger.info(f"✅ VALID: {email}")
-                self.save_to_file(email, 'valid', final_url)
-            else:
-                logger.info(f"❌ INVALID: {email}")
-                self.save_to_file(email, 'invalid', final_url)
-            
-            return {
-                'email': email,
-                'valid': is_valid,
-                'final_url': final_url,
-                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-        except TimeoutException:
-            logger.error(f"⏰ Timeout for: {email}")
-            self.save_to_file(email, 'invalid', 'TIMEOUT')
-            return {
-                'email': email,
-                'valid': False,
-                'final_url': 'TIMEOUT',
-                'error': 'Timeout',
-                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-        except Exception as e:
-            logger.error(f"❌ Error validating {email}: {e}")
-            self.save_to_file(email, 'invalid', f'ERROR: {str(e)}')
-            return {
-                'email': email,
-                'valid': False,
-                'final_url': f'ERROR: {str(e)}',
-                'error': str(e),
-                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
-            }
+            # If ambiguous fallback invalid AND URL didn't change, give it one quick retry to avoid false negatives
+            if is_invalid and reason == 'fallback_invalid' and final_url == initial_url:
+                logger.debug(f"⚠️ Ambiguous result for {email}, re-checking once before marking invalid...")
+                time.sleep(1.5)
+                final_url = self.driver.current_url
+                try:
+                    page_source = self.driver.page_source
+                except Exception:
+                    page_source = ''
+                is_valid2, is_invalid2, is_detection2, reason2 = classify_page(final_url, page_source)
+                logger.debug(f"🔁 Re-check classification: valid={is_valid2} invalid={is_invalid2} detect={is_detection2} reason={reason2}")
+                # keep detection if seen
+                if is_detection2:
+                    raise BrowserDetectedException(f"Browser detected/blocked due to: {reason2}")
+                is_valid, is_invalid, is_detection, reason = is_valid2, is_invalid2, is_detection2, reason2
+        
+        # If detection found, raise exception to trigger browser restart
+        if is_detection:
+            logger.error(f"❗ Browser blocked/detected (reason={reason}) for {email}")
+            # Raise our custom exception so caller can distinguish detection vs other webdriver errors
+            raise BrowserDetectedException(f"Browser detected/blocked due to: {reason}")
+        
+        # Determine if valid/invalid
+        # We already used classify_page; use its results
+        
+        if is_valid:
+            logger.info(f"✅ VALID: {email}")
+        else:
+            logger.info(f"❌ INVALID: {email}")
+        
+        # Small delay to allow visual confirmation if user is watching
+        time.sleep(1.0)
+        
+        return {
+            'email': email,
+            'valid': is_valid,
+            'final_url': final_url,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+        }
     
     def close(self):
         """Close browser"""
@@ -426,150 +524,58 @@ class AfterPayBatchValidator:
                             except Exception:
                                 pass
                         self.driver.quit()
-                        logger.info("🚪 Browser closed (quit called)")
+                        logger.debug("🚪 Browser closed (quit called)")
                     except Exception as inner_e:
                         # Some drivers (mock) may not have quit/close; ignore and continue to force kill
                         logger.warning(f"⚠️ Error calling driver.close()/quit(): {inner_e}")
                 except Exception as e:
                     logger.warning(f"⚠️ Error calling driver.quit(): {e}")
                 # (Deprecated older termination block removed)
-                # Ensure process killed if still running
+                # Ensure process killed if still running - Windows compatible
                 try:
                     svc = getattr(self.driver, 'service', None)
                     proc = getattr(svc, 'process', None) if svc else None
                     pid = getattr(proc, 'pid', None) if proc else None
                     if pid:
-                        # Attempt graceful termination then force kill
-                        # Try a number of escalation steps: proc.kill -> psutil -> os.kill -> subprocess kill -9
-                        for attempt_kill in range(3):
+                        # Windows-compatible process termination
+                        if PSUTIL_AVAILABLE:
                             try:
-                                # Step 1: call service.process.kill if available
-                                if hasattr(proc, 'kill') and callable(proc.kill):
-                                    try:
-                                        proc.kill()
-                                    except Exception:
-                                        pass
-                                # Step 2: psutil-based terminate/killing of children & parent
-                                if PSUTIL_AVAILABLE:
-                                    try:
-                                        p = psutil.Process(pid)
-                                        children = p.children(recursive=True)
-                                        for c in children:
-                                            try:
-                                                c.terminate()
-                                            except Exception:
-                                                pass
-                                        gone, alive = psutil.wait_procs(children, timeout=1)
-                                        try:
-                                            p.terminate()
-                                        except Exception:
-                                            pass
-                                        p.wait(timeout=1)
-                                    except Exception:
-                                        pass
-                                # Step 3: fallback to os.kill
-                                try:
-                                    os.kill(pid, signal.SIGTERM)
-                                except Exception:
-                                    pass
-                                time.sleep(0.2)
-                                # If still alive, escalate
-                                try:
-                                    os.kill(pid, 0)
-                                    # process is still alive, escalate
-                                    try:
-                                        os.kill(pid, signal.SIGKILL)
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    # Process is gone
-                                    break
-                                time.sleep(0.2)
-                            except Exception:
-                                pass
-                        # If still alive after above, attempt subprocess kill -9 and group kill
-                        try:
-                            try:
-                                os.kill(pid, 0)
-                                # kill group
-                                try:
-                                    pgid = os.getpgid(pid)
-                                    if pgid:
-                                        os.killpg(pgid, signal.SIGKILL)
-                                except Exception:
-                                    pass
-                                subprocess.run(["kill", "-9", str(pid)], check=False)
-                                time.sleep(0.2)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        try:
-                            # If the service object provides a kill method, use it first
-                            if hasattr(proc, 'kill') and callable(proc.kill):
-                                try:
-                                    proc.kill()
-                                except Exception:
-                                    pass
-                            if PSUTIL_AVAILABLE:
                                 p = psutil.Process(pid)
+                                # Kill all children first
                                 children = p.children(recursive=True)
                                 for c in children:
                                     try:
-                                        c.terminate()
-                                    except Exception:
+                                        c.kill()
+                                    except (psutil.NoSuchProcess, psutil.AccessDenied):
                                         pass
+                                # Wait for children to terminate
                                 gone, alive = psutil.wait_procs(children, timeout=1)
+                                # Kill parent process
                                 try:
-                                    p.terminate()
-                                except Exception:
+                                    p.kill()
+                                    p.wait(timeout=2)
+                                    logger.debug(f"🧹 Killed driver process PID {pid} (via psutil)")
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
                                     pass
-                                p.wait(timeout=1)
-                                logger.info(f"🧹 Terminated driver process PID {pid} (via psutil)")
-                        except Exception:
-                            # Fallback to os.kill
+                            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                                logger.debug(f"Process {pid} already terminated or access denied: {e}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Error killing process {pid} with psutil: {e}")
+                        else:
+                            # Fallback without psutil - use subprocess.Popen.kill()
                             try:
-                                os.kill(pid, signal.SIGTERM)
-                                time.sleep(0.5)
-                                # If still alive, send SIGKILL
-                                try:
-                                    os.kill(pid, 0)
-                                    os.kill(pid, signal.SIGKILL)
-                                    logger.info(f"🧹 Killed driver process PID {pid} (SIGKILL)")
-                                except Exception:
-                                    # Already gone
-                                    pass
+                                if hasattr(proc, 'kill') and callable(proc.kill):
+                                    proc.kill()
+                                    logger.debug(f"🧹 Killed driver process PID {pid} (via proc.kill)")
                             except Exception as e:
                                 logger.warning(f"⚠️ Could not kill process PID {pid}: {e}")
-                except Exception:
-                    pass
-                # Final fallback: use system kill via shell to make sure it's removed
-                try:
-                    alive = True
-                    try:
-                        os.kill(pid, 0)
-                        alive = True
-                    except Exception:
-                        alive = False
-                    if alive:
-                        logger.info(f"🔎 Attempting final kill via system command for PID {pid}")
-                        try:
-                            subprocess.run(["kill", "-9", str(pid)], check=False)
-                            time.sleep(0.2)
-                            try:
-                                os.kill(pid, 0)
-                                logger.warning(f"⚠️ PID {pid} still exists after kill -9")
-                            except Exception:
-                                logger.info(f"🧹 PID {pid} removed after kill -9")
-                        except Exception as e:
-                            logger.warning(f"⚠️ Error running kill -9 for pid {pid}: {e}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"⚠️ Error during process cleanup: {e}")
             # Clean up temporary profile dir if it was created
             if getattr(self, 'profile_dir', None):
                 try:
                     shutil.rmtree(self.profile_dir, ignore_errors=True)
-                    logger.info(f"🧹 Removed temporary profile dir: {self.profile_dir}")
+                    logger.debug(f"🧹 Removed temporary profile dir: {self.profile_dir}")
                 except Exception as e:
                     logger.warning(f"⚠️ Could not remove profile dir {self.profile_dir}: {e}")
                 finally:
@@ -578,9 +584,9 @@ class AfterPayBatchValidator:
             logger.error(f"Error closing browser: {e}")
 
     def wait_until_ready(self, check_url: str = "https://portal.afterpay.com/en-US", timeout: int = 20) -> bool:
-        """Attempt to load check_url and ensure an expected element is present.
-
-        Returns True if loaded and ready, False otherwise.
+        """Attempt to ensure driver is responsive.
+        
+        We perform a simple liveness check instead of loading the full portal to speed up startup.
         """
         if not self.driver:
             return False
@@ -589,13 +595,21 @@ class AfterPayBatchValidator:
             # Keep trying until timeout
             while time.time() - start < timeout:
                 try:
-                    self.driver.get(check_url)
-                    WebDriverWait(self.driver, 6).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email']"))
-                    )
-                    logger.info("✅ Browser ready: email input found")
+                    # Simple liveness check: can we get the title or current_url?
+                    # Also catch NoSuchWindowException specifically
+                    _ = self.driver.title
+                    logger.debug("✅ Browser ready (liveness check passed)")
                     return True
                 except Exception as inner_e:
+                    msg = str(inner_e).lower()
+                    if 'no such window' in msg or 'target window already closed' in msg:
+                        logger.debug(f"⚠️ Window closed during readiness check, trying to switch/reopen... ({inner_e})")
+                        try:
+                            if self.driver.window_handles:
+                                self.driver.switch_to.window(self.driver.window_handles[0])
+                                continue
+                        except Exception:
+                            pass
                     logger.debug(f"Waiting for browser readiness: {inner_e}")
                     time.sleep(0.5)
             return False
@@ -643,6 +657,7 @@ class AfterPayBatchProcessor:
             pass
 
     def _kill_pid(self, pid: int):
+        """Kill a process by PID - Windows compatible"""
         try:
             if PSUTIL_AVAILABLE:
                 try:
@@ -650,19 +665,19 @@ class AfterPayBatchProcessor:
                     for c in p.children(recursive=True):
                         try:
                             c.kill()
-                        except Exception:
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
                     p.kill()
-                except Exception:
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            else:
+                # Windows fallback using taskkill
+                if sys.platform == 'win32':
                     try:
-                        os.kill(pid, 9)
+                        subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], 
+                                     capture_output=True, timeout=5)
                     except Exception:
                         pass
-            else:
-                try:
-                    os.kill(pid, 9)
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -675,7 +690,7 @@ class AfterPayBatchProcessor:
             logger.debug("psutil not available - skipping orphan driver cleanup")
             return
         
-        logger.info("🧹 Cleaning up orphan drivers...")
+        logger.debug("🧹 Cleaning up orphan drivers...")
         start_cleanup = time.time()
         my_pid = os.getpid()
         
@@ -705,7 +720,7 @@ class AfterPayBatchProcessor:
                     # Check for our specific markers
                     if ('ap_profile_' in cmdline or 'undetected_chromedriver' in cmdline or 'undetect' in cmdline) and pid not in current_pids:
                         try:
-                            logger.info(f"🧹 Killing orphan driver PID {pid}")
+                            logger.debug(f"🧹 Killing orphan driver PID {pid}")
                             p.kill()
                         except Exception:
                             pass
@@ -734,9 +749,9 @@ class AfterPayBatchProcessor:
             logger.error(f"❌ Error loading emails: {e}")
             return []
     
-    def browser_worker(self, browser_id):
+    def browser_worker(self, browser_id, window_position=None):
         """Worker thread for processing emails"""
-        logger.info(f"🚀 Browser {browser_id} starting...")
+        logger.debug(f"🚀 Browser {browser_id} starting...")
         
         try:
             # Create validator for this browser; if creation or readiness fails, keep retrying
@@ -749,11 +764,11 @@ class AfterPayBatchProcessor:
                 validator = None
                 for attempt in range(1, max_startup_attempts + 1):
                     try:
-                        logger.info(f"🔧 Browser {browser_id} startup attempt {attempt}/{max_startup_attempts}")
+                        logger.debug(f"🔧 Browser {browser_id} startup attempt {attempt}/{max_startup_attempts}")
                         # Use random profile after the 1st attempt to minimize re-detection
-                        validator = AfterPayBatchValidator(headless=self.headless, random_profile=(attempt > 1))
+                        validator = AfterPayBatchValidator(headless=self.headless, random_profile=(attempt > 1), window_position=window_position)
                         if validator and validator.wait_until_ready(timeout=self.driver_startup_timeout):
-                            logger.info(f"✅ Validator for browser {browser_id} confirmed ready (attempt {attempt})")
+                            logger.debug(f"✅ Validator for browser {browser_id} confirmed ready (attempt {attempt})")
                             # Register pid and notify readiness
                             try:
                                 svc = getattr(validator, 'service', None)
@@ -762,7 +777,7 @@ class AfterPayBatchProcessor:
                                 if pid:
                                     with self._pid_lock:
                                         self.browser_pids[browser_id] = pid
-                                    logger.info(f"🔎 Registered Browser {browser_id} PID: {pid}")
+                                    logger.debug(f"🔎 Registered Browser {browser_id} PID: {pid}")
                                 if callable(self.ready_callback):
                                     try:
                                         self.ready_callback(browser_id, pid)
@@ -779,8 +794,8 @@ class AfterPayBatchProcessor:
                             except Exception:
                                 pass
                             validator = None
-                    except Exception as e:
-                        logger.warning(f"⚠️ Could not create validator (attempt {attempt}): {e}")
+                    except Exception as e1:
+                        logger.warning(f"⚠️ Could not create validator (attempt {attempt}): {e1}")
                         try:
                             if validator:
                                 validator.close()
@@ -802,8 +817,8 @@ class AfterPayBatchProcessor:
                 # Ensure validator exists; if it's None (previous close failed), try creating again
                 if validator is None:
                     try:
-                        validator = AfterPayBatchValidator(headless=self.headless)
-                        logger.info(f"🔁 Recreated validator for browser {browser_id}")
+                        validator = AfterPayBatchValidator(headless=self.headless, window_position=window_position)
+                        logger.debug(f"🔁 Recreated validator for browser {browser_id}")
                     except Exception as e:
                         logger.warning(f"⚠️ Could not recreate validator for browser {browser_id}: {e}")
                         time.sleep(0.5)
@@ -818,7 +833,7 @@ class AfterPayBatchProcessor:
                     continue
 
                 try:
-                    logger.info(f"🌐 Browser {browser_id} processing: {email}")
+                    logger.debug(f"🌐 Browser {browser_id} processing: {email}")
 
                     # Break early if a stop was requested
                     if self._stop_event.is_set():
@@ -827,7 +842,7 @@ class AfterPayBatchProcessor:
                     # Make sure validator is still available and ready; recreate if needed
                     if validator is None:
                         try:
-                            validator = AfterPayBatchValidator(headless=self.headless, random_profile=True)
+                            validator = AfterPayBatchValidator(headless=self.headless, random_profile=True, window_position=window_position)
                             if not validator.wait_until_ready(timeout=self.driver_startup_timeout):
                                 logger.warning(f"⚠️ Newly-created validator for browser {browser_id} not ready; continuing")
                                 validator.close()
@@ -905,8 +920,8 @@ class AfterPayBatchProcessor:
                                 
                             # Create fresh validator with random profile IMMEDIATELY
                             try:
-                                logger.info(f"🔄 Browser {browser_id} creating FRESH validator after detection")
-                                validator = AfterPayBatchValidator(headless=self.headless, random_profile=True)
+                                logger.debug(f"🔄 Browser {browser_id} creating FRESH validator after detection")
+                                validator = AfterPayBatchValidator(headless=self.headless, random_profile=True, window_position=window_position)
                                 # If created, register pid
                                 try:
                                     svc = getattr(validator, 'service', None)
@@ -915,10 +930,10 @@ class AfterPayBatchProcessor:
                                     if new_pid:
                                         with self._pid_lock:
                                             self.browser_pids[browser_id] = new_pid
-                                        logger.info(f"🔎 Registered Browser {browser_id} PID: {new_pid}")
+                                        logger.debug(f"🔎 Registered Browser {browser_id} PID: {new_pid}")
                                 except Exception:
                                     pass
-                                logger.info(f"✅ Browser {browser_id} successfully restarted after detection (attempt {attempts})")
+                                logger.debug(f"✅ Browser {browser_id} successfully restarted after detection (attempt {attempts})")
                                 continue  # Retry immediately with fresh browser
                             except Exception as restart_e:
                                 logger.error(f"❌ Browser {browser_id} restart error after detection: {restart_e}")
@@ -968,8 +983,8 @@ class AfterPayBatchProcessor:
                                 break
                             # ALWAYS use random profile for better detection avoidance
                             try:
-                                logger.info(f"🔄 Browser {browser_id} creating FRESH validator with random profile")
-                                validator = AfterPayBatchValidator(headless=self.headless, random_profile=True)
+                                logger.debug(f"🔄 Browser {browser_id} creating FRESH validator with random profile")
+                                validator = AfterPayBatchValidator(headless=self.headless, random_profile=True, window_position=window_position)
                                 try:
                                     svc = getattr(validator, 'service', None)
                                     proc = getattr(svc, 'process', None) if svc else None
@@ -977,7 +992,7 @@ class AfterPayBatchProcessor:
                                     if new_pid:
                                         with self._pid_lock:
                                             self.browser_pids[browser_id] = new_pid
-                                        logger.info(f"🔎 Registered Browser {browser_id} PID: {new_pid}")
+                                        logger.debug(f"🔎 Registered Browser {browser_id} PID: {new_pid}")
                                 except Exception:
                                     pass
                                 
@@ -997,7 +1012,7 @@ class AfterPayBatchProcessor:
                                     except Exception:
                                         pass
                                         
-                                logger.info(f"✅ Browser {browser_id} successfully restarted with fresh profile (attempt {attempts})")
+                                logger.debug(f"✅ Browser {browser_id} successfully restarted with fresh profile (attempt {attempts})")
                                 continue
                             except Exception as restart_e:
                                 logger.error(f"❌ Browser {browser_id} restart error: {restart_e}")
@@ -1026,7 +1041,7 @@ class AfterPayBatchProcessor:
 
                     if requeued:
                         # If we requeued due to detection, skip result storage and do not call task_done()
-                        logger.info(f"🔁 Skipping storing result for {email} (requeued)")
+                        logger.debug(f"🔁 Skipping storing result for {email} (requeued)")
                         continue
                     if result is None:
                         # Fallback in case
@@ -1041,19 +1056,20 @@ class AfterPayBatchProcessor:
                     # Store result
                     with self.results_lock:
                         self.results.append(result)
-
-                    # Callback
+                    
+                    # Save to file first
+                    save_email_result(result['email'], 'valid' if result['valid'] else 'invalid', result.get('final_url'))
+                    
+                    # IMPORTANT: Call progress callback to update GUI (including invalid list)
                     if self.progress_callback:
                         try:
                             self.progress_callback(result)
-                        except Exception:
-                            pass
-
-                    logger.info(f"✅ Browser {browser_id} completed: {email} -> {'VALID' if result['valid'] else 'INVALID'}")
-                    self.email_queue.task_done()
-                    time.sleep(0.5)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error calling progress callback: {e}")
+                    
+                    logger.debug(f"✅ Browser {browser_id} completed: {email} -> {'VALID' if result['valid'] else 'INVALID'}")
                 except Exception as e:
-                    logger.error(f"❌ Browser {browser_id} loop error: {e}")
+                    logger.error(f"❌ Browser {browser_id} error processing {email}: {e}")
                     # If we failed at outer level, continue loop to process remaining emails
                     try:
                         if not self.email_queue.empty():
@@ -1073,10 +1089,13 @@ class AfterPayBatchProcessor:
                             self.browser_pids.pop(browser_id, None)
                 except Exception:
                     pass
-                validator.close()
-            except Exception:
-                pass
-            logger.info(f"🏁 Browser {browser_id} finished")
+                if validator:
+                    logger.debug(f"🔒 Closing browser {browser_id}...")
+                    validator.close()
+                    logger.debug(f"✅ Browser {browser_id} closed successfully")
+            except Exception as e:
+                logger.warning(f"⚠️ Error closing browser {browser_id}: {e}")
+            logger.debug(f"🏁 Browser {browser_id} finished")
             
         except Exception as e:
             logger.error(f"❌ Browser {browser_id} failed to start: {e}")
@@ -1103,9 +1122,28 @@ class AfterPayBatchProcessor:
         
         # Start browser threads
         threads = []
+        screen_width = 1920  # Asumsi resolusi standar
+        screen_height = 1080
+        window_width = 500
+        window_height = 500
+        
+        # Hitung posisi grid (misal 3 kolom)
+        cols = 3
+        
         for i in range(min(self.num_browsers, len(emails))):
             browser_id = i + 1
-            thread = threading.Thread(target=self.browser_worker, args=(browser_id,))
+            
+            # Hitung posisi x, y agar rapi
+            row = i // cols
+            col = i % cols
+            pos_x = col * window_width
+            pos_y = row * window_height
+            
+            # Pastikan tidak keluar layar (opsional)
+            if pos_x > screen_width: pos_x = 0
+            if pos_y > screen_height: pos_y = 0
+            
+            thread = threading.Thread(target=self.browser_worker, args=(browser_id, (pos_x, pos_y)))
             thread.start()
             threads.append(thread)
             # Stagger browser starts to reduce simultaneous resource spike
@@ -1155,8 +1193,35 @@ class AfterPayBatchProcessor:
         return summary
 
     def stop(self):
-        """Set stop flag to signal worker threads to stop"""
+        """Set stop flag to signal worker threads to stop and cleanup all browsers"""
+        logger.info("🛑 Stop requested - signaling all workers to stop...")
         self._stop_event.set()
+        
+        # Give threads a moment to detect stop flag and start cleanup
+        time.sleep(0.5)
+        
+        # Force cleanup of any remaining browser PIDs
+        try:
+            with self._pid_lock:
+                pids_to_kill = list(self.browser_pids.values())
+            
+            if pids_to_kill:
+                logger.info(f"🧹 Force cleanup of {len(pids_to_kill)} browser processes...")
+                for pid in pids_to_kill:
+                    if pid:
+                        try:
+                            self._kill_pid(pid)
+                            logger.debug(f"✅ Killed browser PID: {pid}")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Could not kill PID {pid}: {e}")
+                
+                # Clear the registry
+                with self._pid_lock:
+                    self.browser_pids.clear()
+                    
+                logger.info("✅ All browsers stopped and cleaned up")
+        except Exception as e:
+            logger.warning(f"⚠️ Error during stop cleanup: {e}")
 
     def pause(self):
         """Pause processing (workers will wait between jobs)"""

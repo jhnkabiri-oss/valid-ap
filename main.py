@@ -24,14 +24,14 @@ except Exception as e:
     print(f"❌ ap.py import failed: {e}")
 
 try:
-    import conservative_batch
-    importlib.reload(conservative_batch)  # Auto-reload 
-    from conservative_batch import PeopleDataLabsLookup, extract_person_info, format_output, append_to_lookup_file
+    import lookup
+    importlib.reload(lookup)  # Auto-reload 
+    from lookup import PeopleDataLabsLookup, extract_person_info, format_output, append_to_lookup_file
     LOOKUP_AVAILABLE = True
-    print("✅ conservative_batch.py auto-reloaded successfully")
+    print("✅ lookup.py auto-reloaded successfully")
 except Exception as e:
     LOOKUP_AVAILABLE = False
-    print(f"❌ conservative_batch.py import failed: {e}")
+    print(f"❌ lookup.py import failed: {e}")
 
 # --- Custom Styles ---
 STYLE_MAIN_BG = "background-color: #191b21;"  # Background Navy Gelap
@@ -676,11 +676,17 @@ class MainWindow(QMainWindow):
     def stop_validation(self):
         """Request stop for validation"""
         if self.validation_thread:
+            self.log_message("🛑 Stop requested - closing all browsers...")
             self.validation_thread.stop()
             self.log_message("⏹️ Stopping validation...")
+            # Disable buttons during cleanup
+            self.btn_start_validate.setEnabled(False)
+            self.btn_stop_validate.setEnabled(False)
             # Reset pause button state
             self.btn_pause_validate.setText("Pause Validate")
             self.btn_pause_validate.setEnabled(False)
+        else:
+            self.log_message("⚠️ No validation running")
 
     def pause_resume_validation(self):
         """Toggle pause/resume for validation"""
@@ -714,25 +720,30 @@ class MainWindow(QMainWindow):
 
     def on_email_processed(self, email, is_valid):
         # Always mark item as processed (grey/disabled)
-        self.mark_list_item_processed(email, is_valid)
-
-        if is_valid:
-            self.valid_console.append(f"✅ VALID - {email}")
-            if email not in self.valid_emails:
-                self.valid_emails.append(email)
-        else:
-            self.log_message(f"❌ INVALID - {email}")
-            if email not in self.invalid_emails:
-                self.invalid_emails.append(email)
-            try:
-                self.invalid_console.append(f"❌ INVALID - {email}")
-            except Exception:
-                pass
-        # Mark the item in the list as processed (disabled and greyed).
         try:
             self.mark_list_item_processed(email, is_valid)
         except Exception:
             pass
+
+        if is_valid:
+            # Add to valid console
+            self.valid_console.append(f"✅ VALID - {email}")
+            if email not in self.valid_emails:
+                self.valid_emails.append(email)
+            self.log_message(f"✅ VALID - {email}")
+        else:
+            # Add to invalid console - CRITICAL: Must update the invalid list!
+            if email not in self.invalid_emails:
+                self.invalid_emails.append(email)
+            
+            # Update invalid console (the text area)
+            try:
+                self.invalid_console.append(f"❌ INVALID - {email}")
+            except Exception as e:
+                self.log_message(f"⚠️ Could not update invalid console: {e}")
+            
+            # Also log to main logger
+            self.log_message(f"❌ INVALID - {email}")
 
     def on_email_processing_started(self, email, browser_id):
         """Handle when GUI worker starts processing an email - remove from the list in real-time
@@ -780,14 +791,24 @@ class MainWindow(QMainWindow):
             pass
 
     def on_validation_finished(self):
-        self.log_message("✅ Validation complete")
+        self.log_message("✅ Validation complete - All browsers closed")
         self.btn_start_validate.setEnabled(True)
         self.btn_stop_validate.setEnabled(False)
         self.btn_lookup_data.setEnabled(True)
-        self.validation_thread = None
+        
+        # Cleanup validation thread reference
+        if self.validation_thread:
+            try:
+                # Ensure stop is called one more time for safety
+                self.validation_thread.stop()
+            except Exception:
+                pass
+            self.validation_thread = None
+        
         # Reset pause button
         self.btn_pause_validate.setText("Pause Validate")
         self.btn_pause_validate.setEnabled(False)
+        
         # Keep counters but you can reset them if desired — here we reset labels
         try:
             for lbl in self.restart_labels:
@@ -800,6 +821,8 @@ class MainWindow(QMainWindow):
             self.browser_restart_counts = {}
         except Exception:
             pass
+        
+        self.log_message("🧹 Cleanup complete")
 
     def on_browser_ready(self, browser_id, pid):
         """Handle GUI update when a browser is confirmed ready"""
