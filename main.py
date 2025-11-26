@@ -176,7 +176,7 @@ class GuiLogHandler(logging.Handler):
 class ValidationThread(QThread):
     progress = Signal(int, int, int)  # processed, valid, invalid
     log = Signal(str)
-    email_processed = Signal(str, bool)
+    email_processed = Signal(str, bool, str)
     email_processing_started = Signal(str, int)  # email, browser_id
     browser_ready = Signal(int, int)  # browser_id, pid
     restart_event = Signal(int, int, str, object)  # browser_id, attempt, reason, old_pid
@@ -212,7 +212,8 @@ class ValidationThread(QThread):
                     self._valid += 1
                 else:
                     self._invalid += 1
-                self.email_processed.emit(result.get('email'), result.get('valid'))
+                # Emit the display string (created in ap.py) so the GUI shows the same text as valid.txt
+                self.email_processed.emit(result.get('email'), result.get('valid'), result.get('display'))
                 self.progress.emit(self._processed, self._valid, self._invalid)
 
             # processing callback called when an email is dequeued and processing starts
@@ -306,12 +307,17 @@ class LookupThread(QThread):
                 api_key = "af4f887ea97581b4bd22d61bc2be713116e27753f44897d107e2b02d43297601"
             lookup = PeopleDataLabsLookup(api_key)
 
-            for i, email in enumerate(self.emails, 1):
+            for i, email_item in enumerate(self.emails, 1):
                 if self._stop_event.is_set():
                     break
                 # Pause handling: block while paused
                 while self._pause_event.is_set() and not self._stop_event.is_set():
                     time.sleep(0.2)
+                # Support both plain email string and tuple (email, display_line)
+                if isinstance(email_item, (list, tuple)):
+                    email, display_line = email_item[0], email_item[1]
+                else:
+                    email, display_line = email_item, None
                 self.log.emit(f"🔍 Looking up {i}/{len(self.emails)}: {email}")
                 res = lookup.search_by_email(email, show_rate_info=(i==1))
                 if res == "RATE_LIMITED":
@@ -320,15 +326,25 @@ class LookupThread(QThread):
                 if res:
                     person_info = extract_person_info(res)
                     formatted = format_output(person_info, email)
-                    # Save lookup results into lookup.txt (do not mix with valid.txt)
-                    append_to_lookup_file(formatted)
-                    self.lookup_result.emit(email, formatted)
+                    # Build export block: include VALID AP header with display line, followed by DB
+                    display_line = display_line or email
+                    # If display_line starts with '✅ VALID - ', strip it
+                    if isinstance(display_line, str) and display_line.startswith('✅ VALID - '):
+                        display_line = display_line.split('✅ VALID - ', 1)[1].strip()
+                    inner_block = f"VALID AP\nEmail : {display_line}\n\nDB\n{formatted}"
+                    # Save lookup results into lookup.txt
+                    append_to_lookup_file(inner_block)
+                    # Emit inner_block for UI
+                    self.lookup_result.emit(email, inner_block)
                     self.log.emit(f"✅ Lookup done for {email}")
                 else:
                     formatted = format_output(None, email)
-                    # Save lookup results into lookup.txt even if no data
-                    append_to_lookup_file(formatted)
-                    self.lookup_result.emit(email, formatted)
+                    display_line = display_line or email
+                    if isinstance(display_line, str) and display_line.startswith('✅ VALID - '):
+                        display_line = display_line.split('✅ VALID - ', 1)[1].strip()
+                    inner_block = f"VALID AP\nEmail : {display_line}\n\nDB\n{formatted}"
+                    append_to_lookup_file(inner_block)
+                    self.lookup_result.emit(email, inner_block)
                     self.log.emit(f"⚠️ No data for {email}")
                 # conservative wait
                 if i < len(self.emails):
@@ -636,6 +652,7 @@ class MainWindow(QMainWindow):
         self.lookup_thread = None
         self.valid_emails = []
         self.invalid_emails = []
+        self._original_loaded_emails = []
         self.lookup_results = []
         self.current_tab = "Logger"
         self.browser_restart_counts = {}
@@ -979,19 +996,27 @@ class MainWindow(QMainWindow):
         self.pbar.setFormat(f"Process {percentage}%")
         self.log_message(f"📊 Processed {processed}/{total} | ✅ {valid_count} | ❌ {invalid_count}")
 
-    def on_email_processed(self, email, is_valid):
-        # Always mark item as processed (grey/disabled)
+    def on_email_processed(self, email, is_valid, display):
+        # Always mark item as processed (remove from list)
         try:
             self.mark_list_item_processed(email, is_valid)
         except Exception:
             pass
 
         if is_valid:
-            # Add to valid console
-            self.valid_console.append(f"✅ VALID - {email}")
+            # Add to valid console - now use `display` (single line with phone ending if present)
+            try:
+                if display:
+                    self.valid_console.append(display)
+                else:
+                    self.valid_console.append(f"✅ VALID - {email}")
+            except Exception:
+                # fallback
+                self.valid_console.append(f"✅ VALID - {email}")
             if email not in self.valid_emails:
                 self.valid_emails.append(email)
-            self.log_message(f"✅ VALID - {email}")
+            # Log using the display string
+            self.log_message(display if display else f"✅ VALID - {email}")
         else:
             # Add to invalid console - CRITICAL: Must update the invalid list!
             if email not in self.invalid_emails:
@@ -1187,17 +1212,29 @@ class MainWindow(QMainWindow):
             for line in console_text.splitlines():
                 line = line.strip()
                 if line.startswith('✅ VALID - '):
-                    email = line.split('✅ VALID - ', 1)[1].strip()
+                    rest = line.split('✅ VALID - ', 1)[1].strip()
+                    # Extract pure email from 'rest' which may include a mask or additional text
+                    m = email_rx.search(rest)
+                    if m:
+                        email = m.group(0)
+                    else:
+                        email = rest
                     if email and email not in seen:
                         seen.add(email)
-                        out.append(email)
+                        out.append((email, line))
                         count_console_explicit += 1
 
             # 2) Scan the console for any other email-like patterns (e.g., blocks / appended text)
             for m in email_rx.findall(console_text):
                 if m not in seen:
                     seen.add(m)
-                    out.append(m)
+                    # Find a console line containing this email for display (fallback)
+                    display_line = m
+                    for ln in console_text.splitlines():
+                        if m in ln:
+                            display_line = ln.strip()
+                            break
+                    out.append((m, display_line))
         except Exception:
             count_console_explicit = 0
 
@@ -1210,7 +1247,13 @@ class MainWindow(QMainWindow):
                     file_count_total += 1
                     if m not in seen:
                         seen.add(m)
-                        out.append(m)
+                        # Try to find the display line in the file
+                        display_line = m
+                        for ln in content.splitlines():
+                            if m in ln:
+                                display_line = ln.strip()
+                                break
+                        out.append((m, display_line))
         except FileNotFoundError:
             file_count_total = 0
         except Exception:
@@ -1282,16 +1325,13 @@ class MainWindow(QMainWindow):
         self.log_message("⏹️ Stopping lookup...")
 
     def on_lookup_result(self, email, formatted_result):
-        # Wrap result with separator and append a blank line after it
-        sep = "=" * 50
+        # formatted_result here is the inner block (VALID AP + DB).
+        # For GUI display we wrap the block with the same separators used by files
+        # so the user sees consistent formatting in Lookup tab.
+        sep = '=' * 50
         block = f"{sep}\n{formatted_result}\n{sep}\n\n"
         self.lookup_console.append(block)
         self.lookup_results.append(block)
-        # Also add to valid_console so user sees results on Valid tab
-        try:
-            self.valid_console.append(block)
-        except Exception:
-            pass
 
     def on_lookup_finished(self):
         self.log_message("✅ Lookup complete")
@@ -1394,6 +1434,11 @@ class MainWindow(QMainWindow):
                                     self.valid_emails.append(email)
             except Exception:
                 pass
+            # Populate left email_list with display lines instead of just emails so 'Valid' tab has masked numbers
+        # Keep the left email_list as the original list (do not replace with display entries)
+        # The Valid Email tab uses `valid_console` for display (masked numbers) and we
+        # remove processed items from the left list as they are processed. No further
+        # action is required here to modify the left list entries.
 
         # If user opens Invalid tab and it's empty, attempt to load from invalid.txt
         if tab_name == "Invalid Email" and not self.invalid_console.toPlainText().strip():
@@ -1409,6 +1454,17 @@ class MainWindow(QMainWindow):
                                     self.invalid_emails.append(email)
             except Exception:
                 pass
+        # If user switches away from Valid Email, restore original loaded emails into left list (if we modified it earlier)
+        try:
+            if tab_name != "Valid Email" and self._original_loaded_emails:
+                # Detect if the current left list looks like valid entries (contains '✅ VALID - '), if so restore
+                if self.email_list.count() > 0:
+                    first_text = self.email_list.item(0).text()
+                    if '✅ VALID - ' in first_text or '❌ INVALID - ' in first_text:
+                        # restore original
+                        self.set_email_list(self._original_loaded_emails)
+        except Exception:
+            pass
 
     def log_message(self, message):
         """Add message to log with timestamp"""
@@ -1435,8 +1491,23 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{i:02d}. {email}")
             item.setData(Qt.UserRole, email)
             self.email_list.addItem(item)
+        # Store original loaded list to allow restore
+        self._original_loaded_emails = list(emails) if emails else []
         if emails:
             self.pbar.setMaximum(len(emails))
+            self.pbar.setValue(0)
+
+    def set_email_list_with_display(self, display_entries):
+        """Set the left email list with display entries (list of (email, display_line) tuples).
+        Items' Qt.UserRole will store the raw email address so functionality stays the same.
+        """
+        self.email_list.clear()
+        for i, (email, display_line) in enumerate(display_entries, 1):
+            item = QListWidgetItem(f"{i:02d}. {display_line}")
+            item.setData(Qt.UserRole, email)
+            self.email_list.addItem(item)
+        if display_entries:
+            self.pbar.setMaximum(len(display_entries))
             self.pbar.setValue(0)
 
     def load_email_list(self):
@@ -1473,24 +1544,15 @@ class MainWindow(QMainWindow):
         self.log_message("🗑️ Email list cleared")
 
     def mark_list_item_processed(self, email, is_valid):
-        """Mark a QListWidgetItem as disabled+greyed when processed.
-        Marks the first enabled matching item.
-        """
+        """Remove the processed item from email_list instead of just disabling it"""
         for i in range(self.email_list.count()):
             item = self.email_list.item(i)
             text = item.text()
-            if '. ' in text:
-                item_email = text.split('. ', 1)[1]
-            else:
-                item_email = text
-            if item_email.strip().lower() == email.strip().lower() and (item.flags() & Qt.ItemIsEnabled):
-                # Disable item
-                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
-                # Set grey text color
-                item.setForeground(QColor('#888888'))
-                # Append status symbol
-                stat = ' ✅' if is_valid else ' ❌'
-                item.setText(text + stat)
+            # Prefer to compare against UserRole (raw email) if set
+            item_email = item.data(Qt.UserRole) if item.data(Qt.UserRole) else (text.split('. ', 1)[1] if '. ' in text else text)
+            if item_email and item_email.strip().lower() == email.strip().lower() and (item.flags() & Qt.ItemIsEnabled):
+                # Remove item from list
+                self.email_list.takeItem(i)
                 break
 
 

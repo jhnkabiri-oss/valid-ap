@@ -1,9 +1,9 @@
 VSVersionInfo(
 ffi=FixedFileInfo(
-# File Version: 1.0.0.0
-filevers=(1, 0, 0, 0),
-# Product Version: 1.0.0.0
-prodvers=(1, 0, 0, 0),
+# File Version: 4.0.0.0
+filevers=(4, 0, 0, 0),
+# Product Version: 4.0.0.0
+prodvers=(4, 0, 0, 0),
 # Bitmask flag (biarkan 0x3f)
 mask=0x3f,
 # File attributes (0x0 = Normal)
@@ -24,12 +24,12 @@ StringTable(
 u'040904B0',
 [StringStruct(u'CompanyName', u'cyberroad.cloud'),
 StringStruct(u'FileDescription', u'validcyberroad Desktop App'),
-StringStruct(u'FileVersion', u'1.0.0'),
+StringStruct(u'FileVersion', u'4.0.0'),
 StringStruct(u'InternalName', u'validcyberroad'),
 StringStruct(u'LegalCopyright', u'Copyright © 2025 cyberroad.cloud'),
 StringStruct(u'OriginalFilename', u'validcyberroad.exe'),
 StringStruct(u'ProductName', u'validcyberroad'),
-StringStruct(u'ProductVersion', u'1.0.0')])
+StringStruct(u'ProductVersion', u'4.0.0')])
 ]),
 VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
 ]
