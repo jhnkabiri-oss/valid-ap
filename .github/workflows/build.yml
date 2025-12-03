@@ -27,7 +27,8 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller --noconfirm --onefile --windowed --name "validcyberroad" --version-file "version_info.txt" main.py
+        # Include the app icon so the resulting EXE shows your custom logo
+        pyinstaller --noconfirm --onefile --windowed --name "validcyberroad" --version-file "version_info.txt" --icon "app.ico" main.py
 
     - name: Compile Inno Setup Script
       run: |
