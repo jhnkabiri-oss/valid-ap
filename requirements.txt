@@ -4,3 +4,4 @@ undetected-chromedriver==3.5.5
 requests
 psutil
 setuptools
+chromedriver-autoinstaller

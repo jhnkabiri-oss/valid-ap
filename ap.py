@@ -150,6 +150,9 @@ class AfterPayBatchValidator:
             
             # Basic settings for speed
             options.add_argument('--disable-blink-features=AutomationControlled')
+            # Avoid showing the 'Chrome is being controlled by automated test software' message
+            options.add_experimental_option('excludeSwitches', ['enable-automation'])
+            options.add_experimental_option('useAutomationExtension', False)
             options.add_argument('--disable-extensions')
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-dev-shm-usage')
@@ -203,10 +206,20 @@ class AfterPayBatchValidator:
             
             if chrome_binary:
                 options.binary_location = chrome_binary
+
+            # If we're running from a frozen EXE (PyInstaller), try to ensure a matching chromedriver is available
+            # This helps undetected-chromedriver to work properly when bundled as a singlefile EXE.
+            try:
+                import chromedriver_autoinstaller
+                chromedriver_autoinstaller.install()
+                logger.debug("🔧 chromedriver_autoinstaller ensured a matching chromedriver")
+            except Exception as e:
+                logger.debug(f"🔎 chromedriver_autoinstaller not available or failed: {e}")
             
             # Create driver with fallback methods
             try:
                 # Method 1: Normal undetected chrome
+                # Use uc to create the browser; explicitly handle common frozen EXE pitfalls
                 self.driver = uc.Chrome(options=options, version_main=None)
                 logger.debug("✅ Chrome driver created (Method 1)")
                 try:
@@ -227,6 +240,8 @@ class AfterPayBatchValidator:
                     # Method 3: Regular selenium as fallback
                     from selenium import webdriver
                     regular_options = webdriver.ChromeOptions()
+                    regular_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+                    regular_options.add_experimental_option('useAutomationExtension', False)
                     regular_options.add_argument('--disable-blink-features=AutomationControlled')
                     regular_options.add_argument('--no-sandbox')
                     regular_options.add_argument('--disable-dev-shm-usage')
@@ -234,6 +249,16 @@ class AfterPayBatchValidator:
                     if chrome_binary:
                         regular_options.binary_location = chrome_binary
                     self.driver = webdriver.Chrome(options=regular_options)
+                    try:
+                        # Try to remove navigator.webdriver on fallback regular WebDriver
+                        self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                            'source': (
+                                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                                "delete navigator.webdriver;"
+                            )
+                        })
+                    except Exception:
+                        pass
                     logger.debug("✅ Chrome driver created (Fallback)")
             
             # Small delay after creation
@@ -333,6 +358,17 @@ class AfterPayBatchValidator:
                             raise WebDriverException("Driver process not alive")
                 except Exception:
                     pass
+            # Try to remove navigator.webdriver via CDP (works even on frozen exe)
+            try:
+                self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                    'source': (
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                        "delete navigator.webdriver;"
+                    )
+                })
+                logger.debug("🧩 Injected script to hide navigator.webdriver via CDP")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to inject navigator.webdriver hiding script: {e}")
             except Exception:
                 raise
             
