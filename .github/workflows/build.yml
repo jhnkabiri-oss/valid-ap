@@ -25,15 +25,7 @@ jobs:
         pip install -r requirements.txt
         pip install pyinstaller
     - name: Ensure chromedriver for packaging
-      run: |
-        python - <<'PY'
-        import chromedriver_autoinstaller, shutil, os
-        p = chromedriver_autoinstaller.install()
-        bin_dir = os.path.join(os.getcwd(), 'bin')
-        os.makedirs(bin_dir, exist_ok=True)
-        shutil.copy(p, os.path.join(bin_dir, os.path.basename(p)))
-        print('CHROMEDRIVER_PATH=' + os.path.join(bin_dir, os.path.basename(p)))
-        PY
+      run: python scripts/ensure_chromedriver.py
 
     - name: Build with PyInstaller
       run: |
@@ -41,7 +33,7 @@ jobs:
         pyinstaller --clean --noconfirm --onefile --windowed --name "validcyberroad" --version-file "version_info.txt" \
           --icon "app.ico" \
           --hidden-import=undetected_chromedriver --hidden-import=selenium --hidden-import=chromedriver_autoinstaller \
-          --add-binary "bin\\chromedriver.exe;." \
+          --add-binary "bin/chromedriver.exe;." \
           main.py
 
     - name: Compile Inno Setup Script
